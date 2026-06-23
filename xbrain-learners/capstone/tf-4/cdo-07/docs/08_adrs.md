@@ -18,12 +18,12 @@
   Managed Prometheus cho storage) vì ops overhead thấp và cost pay-per-invocation.
 - **Decision**: Lambda + AMP làm primary stack.
 - **Consequence**:
-  - ✅ Không cần manage server, cost thấp khi idle
-  - ⚠️ AMP là pull-based, không match push-ingest pattern từ microservice
-  - ⚠️ Lambda cold start ~500ms, Circuit Breaker cần stateful process → không phù hợp
+  - Không cần manage server, cost thấp khi idle
+  - AMP là pull-based, không match push-ingest pattern từ microservice
+  - Lambda cold start ~500ms, Circuit Breaker cần stateful process → không phù hợp
 - **Alternatives considered**: N/A (draft ban đầu, chưa compare đủ)
 
-> ⚠️ **Superseded by ADR-001** (2026-06-23): sau khi review diagram và TF4 requirements
+> **Superseded by ADR-001** (2026-06-23): sau khi review diagram và TF4 requirements
 > chi tiết, team đổi sang event-driven hybrid. Lý do cụ thể xem ADR-001.
 
 ---
@@ -40,11 +40,11 @@
   Ingest Worker → Timestream. AI Serving trên ECS Fargate, EventBridge trigger mỗi 5 phút,
   output qua Grafana OSS annotation + SNS → Slack. Audit log ghi S3 SSE-KMS.
 - **Consequence**:
-  - ✅ SQS buffer absorb traffic spike (sudden spike 3× scenario) mà không drop metric
-  - ✅ ECS Fargate giữ Circuit Breaker state liên tục, không cold start
-  - ✅ Grafana OSS self-hosted: không tốn AMG license $9/user/month, full control annotation API
-  - ⚠️ Nhiều component hơn serverless-first: tăng surface area debug trong 6 ngày W12
-  - ⚠️ Timestream SQL syntax khác PromQL: cần sync với AI team trong Telemetry Contract
+  - SQS buffer absorb traffic spike (sudden spike 3× scenario) mà không drop metric
+  - ECS Fargate giữ Circuit Breaker state liên tục, không cold start
+  - Grafana OSS self-hosted: không tốn AMG license $9/user/month, full control annotation API
+  - Nhiều component hơn serverless-first: tăng surface area debug trong 6 ngày W12
+  - Timestream SQL syntax khác PromQL: cần sync với AI team trong Telemetry Contract
 - **Alternatives considered**:
   - **Serverless-first (AMP + Lambda)**: rejected - AMP pull-based không match push pattern,
     Lambda cold start conflict Circuit Breaker (xem ADR-000)
@@ -64,67 +64,18 @@
   + magnetic store 90 ngày (cheap, đáp ứng retention). Ingest Worker BatchWrite 100 records/call.
   AI engine query qua VPC Endpoint, không ra Internet.
 - **Consequence**:
-  - ✅ Managed service: AWS handle provisioning/scaling, CDO-07 không manage server
-  - ✅ 2-tier tự động: hot data memory store cho AI query, cold data magnetic store cho audit
-  - ✅ IAM auth + VPC Endpoint native, không cần custom auth layer
-  - ⚠️ Vendor lock-in: migrate sau capstone cần rewrite query layer trong AI engine
-  - ⚠️ Không support upsert: Ingest Worker retry cùng timestamp → duplicate, cần idempotency check
+  - Managed service: AWS handle provisioning/scaling, CDO-07 không manage server
+  - 2-tier tự động: hot data memory store cho AI query, cold data magnetic store cho audit
+  - IAM auth + VPC Endpoint native, không cần custom auth layer
+  - Vendor lock-in: migrate sau capstone cần rewrite query layer trong AI engine
+  - Không support upsert: Ingest Worker retry cùng timestamp → duplicate, cần idempotency check
 - **Alternatives considered**:
   - **AMP**: PromQL native, Grafana plug-and-play. Rejected - pull-based không match Ingest Worker
     push pattern (đã loại ở ADR-001)
   - **S3 + Athena**: cheapest $0.023/GB. Rejected - query latency 2-10s block AI predict call
   - **InfluxDB self-hosted**: powerful TSDB. Rejected - ops overhead quản lý server không
-    phù hợp 6 ngày build W12
+    phù hợp 6 ngày build W12.
 
 ---
 
-<!-- ═══════════════════════════════════════════════════════════════
-     PHẦN BÊN DƯỚI: bạn của bạn điền ADR-003 và ADR-004
-     Deadline: EOD T4 W11 (24/06/2026)
-     ═══════════════════════════════════════════════════════════════ -->
 
-## ADR-003 - Compute cho AI Serving: ECS Fargate over Lambda / EKS
-
-<!-- TODO (bạn kia): component số 7 trong diagram - "AI Serving" trên Private Subnet App Tier
-     Gợi ý context: AI engine serve POST /v1/predict P99 < 1000ms, Circuit Breaker cần
-     stateful process chạy liên tục (không cold start), EventBridge trigger 5 phút/lần.
-     Gợi ý decision: ECS Fargate on-demand (consistent latency, no cold start).
-     Gợi ý alternatives: Lambda (cold start issue), EKS (overkill 1 service). -->
-
-- **Status**: Proposed
-- **Date**: 2026-06-23
-- **Context**: `< TODO >`
-- **Decision**: `< TODO >`
-- **Consequence**:
-  - ✅ `< TODO >`
-  - ⚠️ `< TODO >`
-- **Alternatives considered**:
-  - Lambda: `< TODO >`
-  - EKS: `< TODO >`
-
----
-
-## ADR-004 - Queue/decoupling: SQS giữa Ingest Service và Ingest Worker
-
-<!-- TODO (bạn kia): component số 5 "SQS" + số 6 "BatchWrite 100 records/call" trong diagram
-     Gợi ý context: Ingest Service nhận /v1/telemetry từ ALB, cần decouple với Ingest Worker
-     để absorb sudden spike 3× (k6 scenario). Direct sync call sẽ drop metric nếu Timestream
-     write chậm. Kinesis overkill vì không cần ordered/replay.
-     Gợi ý decision: SQS Standard Queue, visibility timeout 30s, DLQ sau 3 retry. -->
-
-- **Status**: Proposed
-- **Date**: 2026-06-23
-- **Context**: `< TODO >`
-- **Decision**: `< TODO >`
-- **Consequence**:
-  - ✅ `< TODO >`
-  - ⚠️ `< TODO >`
-- **Alternatives considered**:
-  - Kinesis Data Streams: `< TODO >`
-  - Direct synchronous call: `< TODO >`
-
----
-
-<!-- Append ADR mới ở đây khi có quyết định mới trong W12.
-     ADR tiếp theo nên cover: CI/CD (CodeDeploy Blue/Green), Observability (Grafana OSS +
-     CloudWatch), Security baseline (IAM least-privilege + 3-tier subnet). -->
