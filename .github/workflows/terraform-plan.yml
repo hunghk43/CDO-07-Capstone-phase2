@@ -5,9 +5,6 @@ on:
     branches:
       - develop
       - main
-    paths:
-      - 'xbrain-learners/capstone/tf-4/cdo-07/infra/**'
-      - '.github/workflows/terraform-plan.yml'
   workflow_dispatch:
     inputs:
       environment:
