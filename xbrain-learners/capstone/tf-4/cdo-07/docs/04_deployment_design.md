@@ -219,7 +219,7 @@ policy và DLQ.
 AI Engine rollback nếu:
 
 - Error rate vượt 1%.
-- P99 latency vượt 800 ms.
+- P99 latency vượt 500 ms.
 - Pre/post-traffic test thất bại.
 
 CodeDeploy tự redeploy last-known-good revision và chuyển traffic về Blue.
