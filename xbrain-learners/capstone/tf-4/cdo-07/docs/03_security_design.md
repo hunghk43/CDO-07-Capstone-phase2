@@ -29,7 +29,7 @@ graph TD
 
         subgraph APP_SUB["Private Subnet - App Tier (10.0.1.0/24)"]
             subgraph APP_SG["ECS App SG (tf4-cdo07-app-sg)"]
-                MOCK["Mock Services (Payment GW, KYC, Reporting)"]
+                MOCK["Mock Services (Payment GW, Ledger, Fraud detection)"]
                 AI["AI Engine (Fargate)"]
             end
             
