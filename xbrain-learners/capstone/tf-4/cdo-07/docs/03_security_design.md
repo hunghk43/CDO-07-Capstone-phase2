@@ -209,7 +209,7 @@ Tất cả AWS resource phải có tag bắt buộc để phục vụ access con
   ```json
   {
     "name": "GRAFANA_API_KEY",
-    "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:<ACCOUNT>:secret:tf4/cdo07/grafana"
+    "valueFrom": "<GRAFANA_SECRET_ARN>"
   }
   ```
   → Inject thành environment variable tại runtime, **không bake vào Docker image**.

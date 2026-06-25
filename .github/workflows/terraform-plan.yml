@@ -1,0 +1,122 @@
+name: terraform-plan
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Terraform environment to plan
+        required: true
+        default: staging
+        type: choice
+        options:
+          - sandbox
+          - staging
+          - prod
+          - bootstrap
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+env:
+  AWS_REGION: ap-southeast-1
+  PROJECT_DIR: xbrain-learners/capstone/tf-4/cdo-07
+
+jobs:
+  plan:
+    name: Terraform plan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Terraform root
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            env_name="${{ inputs.environment }}"
+          elif [[ "${{ github.base_ref }}" == "main" ]]; then
+            env_name="prod"
+          else
+            env_name="staging"
+          fi
+
+          if [[ "$env_name" == "bootstrap" ]]; then
+            root="${PROJECT_DIR}/infra/bootstrap"
+          else
+            root="${PROJECT_DIR}/infra/environments/${env_name}"
+          fi
+
+          echo "environment=${env_name}" >> "$GITHUB_OUTPUT"
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+
+      - name: Detect Terraform root
+        id: terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d "${{ steps.target.outputs.root }}" ]] && find "${{ steps.target.outputs.root }}" -maxdepth 1 -type f -name '*.tf' | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Terraform root missing::${{ steps.target.outputs.root }} has no .tf files; skipping plan."
+          fi
+
+      - name: Set up Terraform
+        if: steps.terraform.outputs.exists == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Terraform fmt
+        if: steps.terraform.outputs.exists == 'true'
+        shell: bash
+        run: terraform -chdir="${PROJECT_DIR}/infra" fmt -check -recursive
+
+      - name: Configure AWS credentials
+        if: steps.terraform.outputs.exists == 'true' && vars.AWS_PLAN_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init
+        if: steps.terraform.outputs.exists == 'true'
+        shell: bash
+        run: terraform -chdir="${{ steps.target.outputs.root }}" init -input=false
+
+      - name: Terraform validate
+        if: steps.terraform.outputs.exists == 'true'
+        shell: bash
+        run: terraform -chdir="${{ steps.target.outputs.root }}" validate
+
+      - name: Terraform plan
+        if: steps.terraform.outputs.exists == 'true' && vars.AWS_PLAN_ROLE_ARN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          plan_output="${RUNNER_TEMP}/terraform-plan-${{ steps.target.outputs.environment }}.txt"
+          terraform -chdir="${{ steps.target.outputs.root }}" plan -input=false -no-color -out=tfplan.bin | tee "$plan_output"
+          {
+            echo "## Terraform plan: ${{ steps.target.outputs.environment }}"
+            echo ""
+            echo '```text'
+            sed -n '1,180p' "$plan_output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Local-only Terraform validation
+        if: steps.terraform.outputs.exists == 'true' && vars.AWS_PLAN_ROLE_ARN == ''
+        shell: bash
+        run: |
+          echo "::notice title=AWS_PLAN_ROLE_ARN missing::Set repository variable AWS_PLAN_ROLE_ARN to enable remote plan."
+          terraform -chdir="${{ steps.target.outputs.root }}" init -backend=false -input=false
+          terraform -chdir="${{ steps.target.outputs.root }}" validate

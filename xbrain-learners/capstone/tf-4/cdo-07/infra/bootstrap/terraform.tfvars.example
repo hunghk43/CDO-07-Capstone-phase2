@@ -1,0 +1,11 @@
+aws_region       = "ap-southeast-1"
+project          = "tf4-cdo07"
+environment      = "bootstrap"
+state_bucket_name = "tf4-cdo07-tf-state-<account-id>"
+
+github_repository       = "CDO-07/CDO-07-Capstone-phase2"
+github_allowed_branches = ["develop", "main"]
+github_allowed_environments = ["staging", "prod"]
+
+terraform_state_prefix    = "tf4-cdo07"
+ecr_image_retention_count = 20
