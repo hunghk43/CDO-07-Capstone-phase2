@@ -106,7 +106,7 @@
 
 - **Status**: Accepted (Updated 2026-06-25 — xem ghi chú Update trong ADR-001)
 - **Date**: 2026-06-23
-- **Context**: 3 mock service (Payment GW, KYC, Reporting) liên tục bắn metric ra ngoài.
+- **Context**: 3 mock service (Payment GW, Ledger, Fraud detection) liên tục bắn metric ra ngoài.
   Nếu cứ để chúng ghi thẳng vào Timestream, một traffic spike (test scenario yêu cầu chịu
   được spike 3×) sẽ làm nghẽn hoặc rớt metric vì Timestream cần ghi theo batch mới tối
   ưu, không hợp để ghi từng record lẻ tẻ ngay khi nó tới. Ngoài ra, theo mục 4.4 của
