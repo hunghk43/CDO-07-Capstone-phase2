@@ -66,7 +66,7 @@ Sau khi nghiên cứu sâu sắc về bản chất bài toán và các rủi ro 
 ## 4. Constraints
 
 - **AWS only** – Không triển khai multi-cloud, chỉ sử dụng các dịch vụ AWS.
-- **Region** – ap-southeast-1 (Singapore) cho toàn bộ môi trường triển khai.
+- **Region** – us-east-1 (North Virginia) cho toàn bộ môi trường triển khai.
 - **Budget cap** – ≤ $200/tháng cho solution capstone.
 - **Single-region deployment** – Không triển khai multi-region, Disaster Recovery chỉ ở mức thiết kế.
 - **Auto-remediation** – Không nằm trong phạm vi dự án; hệ thống chỉ thực hiện prediction và recommendation.
