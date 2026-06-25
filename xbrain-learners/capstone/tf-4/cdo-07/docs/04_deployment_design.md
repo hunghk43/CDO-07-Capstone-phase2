@@ -1,4 +1,4 @@
-# Deployment & CI/CD Design - Task Force 4 · CDO-07
+# Deployment & CI/CD Design - Task Force 4 · CDO-07 
 
 <!-- Doc owner: CDO-07
      Status: Draft W11 T4
