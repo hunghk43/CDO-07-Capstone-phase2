@@ -94,7 +94,7 @@ Các quyết định kiến trúc chính:
 
 - **Option A**: Lambda + API Gateway - Ưu điểm: chi phí theo invoke, auto-scaling · Nhược điểm: cold start 5-10s với ML libraries, giới hạn 15 phút
 - **Option B**: EKS + Kubernetes - Ưu điểm: container orchestration, linh hoạt · Nhược điểm: overhead quản lý cluster, chi phí cao hơn
-- ✅ **Đã chọn**: ECS Fargate + ALB - Lý do: Loại bỏ vấn đề cold start performance, latency dự đoán được <200ms, không cần quản lý cluster
+- ✅ **Đã chọn**: ECS Fargate + ALB - Lý do: Loại bỏ vấn đề cold start performance, latency dự đoán được <500ms, không cần quản lý cluster
 
 ### 5.2 Database
 
