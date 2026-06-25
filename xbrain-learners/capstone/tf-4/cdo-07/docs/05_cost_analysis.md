@@ -1,122 +1,100 @@
-# Cost Analysis - Task Force 4 · CDO-07
+# Cost Analysis - Task force 4 · CDO 07
 
-<!-- Doc owner: CDO-07
-     Status: Skeleton (W11 T6 Pack #1) → Measured actual (W12 T4 Pack #2)
-     Word target: 800-1500 từ
-     Last updated: 2026-06-22 -->
+## 1. Cost model per tenant (forecast)
 
-> **W11 T6**: Điền §1 + §2 + §3 + §4 với forecast estimate.
-> **W12 T4**: Cập nhật §5 với measured actual từ AWS Cost Explorer.
+Dựa trên thiết kế kiến trúc hiện tại, hệ thống phục vụ chính xác 3 tenants (`payment-gateway`, `ledger-service`, `fraud-detection`).
 
----
+| Component | Unit cost (Total) | Tenant avg usage | $/tenant/month (N=3) |
+| --- | --- | --- | --- |
+| **Compute** (ECS Fargate - AI Engine) | $11.25/tháng | Request-level routing theo `service_id`, shared compute pool | $3.75 |
+| **Database** (Amazon Timestream) | $28.50/tháng | Pooled Table, Query Scan theo `service_id` filter | $9.50 |
+| **Storage** (S3 - baseline + audit) | $1.65 + $0.50 = $2.15/tháng | Phân vùng thư mục theo `{service_id}` / `{date}` | $0.72 |
+| **Data transfer** | $0/tháng | Toàn bộ traffic đi qua VPC Endpoints thay vì NAT Gateway | $0.00 |
+| **AI inference** | N/A | ML baseline chạy trên Fargate, không dùng LLM API | $0.00 |
+| **Observability** (Managed Grafana + CloudWatch) | $9.00 + $8.11 = $17.11/tháng | Dashboard clone với variable filter theo tenant | $5.70 |
+| **Shared Core Infra** (ALB, Kinesis, Firehose, VPC Endpoints, Load Gen, Lambda, Budgets) | $120.91/tháng | Hạ tầng nền tảng bắt buộc để vận hành luồng stream | $40.30 |
+| **Total / tenant / month** | **$179.92** |  | **$59.97** |
 
-## 1. Cost model per service/month (forecast)
+### 1.1 Architecture Insights: Phân tích Cost Model
 
-<!-- TODO: Điền sau khi lock differentiation angle (T3 W11) -->
-<!-- Unit cost lấy từ AWS pricing calculator: https://calculator.aws -->
+Mức chi phí **$59.97/tenant/tháng** là khá cao so với kỳ vọng ban đầu. Dưới góc nhìn System Design, điều này xuất phát từ chiến lược **Serverless-first + Managed TSDB** mà nhóm đã chọn. Phần lớn ngân sách ($120.91) rơi vào **Fixed Cost** của hạ tầng mạng và streaming:
 
-| Component | Unit cost | Service avg usage | $/service/month |
-|---|---|---|---|
-| Compute (Fargate/Lambda) | `$X/hr` | `Y hr` | `$Z` |
-| Time-series storage (Timestream/AMP) | `$X/GB-month` | `Y GB` | `$Z` |
-| S3 (audit log + IaC state) | $0.023/GB | ~2 GB | ~$0.05 |
-| Data transfer | $0.09/GB out | `Y GB` | `$Z` |
-| AI inference (Bedrock) | `$X/1k tokens` | `Y calls` | `$Z` |
-| CloudWatch Logs | $0.50/GB ingested | `Y GB` | `$Z` |
-| Secrets Manager | $0.40/secret + $0.05/10k API calls | 4 secrets | ~$2 |
-| Grafana (Managed) | $9/user/month | 2 users | $18 |
-| **Total / service / month** | | | **`$N`** |
+* **VPC Endpoints ($41.50)**: Trả phí duy trì theo giờ (hourly charge) không phụ thuộc vào việc có 1 hay 100 tenant.
+* **Kinesis Provisioned ($32.85)**: Trả phí theo Shard Hour. Dù 3 tenant không dùng hết throughput 1MB/s/shard, ta vẫn phải trả mức phí nền này.
+* **ALB ($18.43)**: Phí duy trì Load Balancer base cost.
 
-> **Budget ceiling**: $200 / 2 tuần capstone. Circuit breaker CloudWatch alarm tại $160 (80%).
+Đây là một trade-off kiến trúc kinh điển: Đổi chi phí cố định (Fixed Cost) lấy sự giảm thiểu tối đa rủi ro vận hành (Zero Ops overhead) và khả năng mở rộng tự động trong thời gian ngắn (4h deploy).
 
-## 2. Cost at scale
+< TODO W12: Thu thập actual usage (Data Ingested/Query Scan) từ 3 tenant trong quá trình test để tính toán marginal cost (biến phí phát sinh thêm khi có tenant thứ 4). >
 
-| Service count | Monthly total (forecast) | Avg per-service |
-|---|---|---|
-| 3 (capstone demo) | `$X` | `$N` |
-| 10 | `$X` | `$N (shared fixed amortize)` |
-| 50 | `$X` | `$N` |
-| 120 (production target) | `$X` | `$N` |
+## 2. Cost at scale (Economies of Scale)
 
-*Fixed cost (VPC, ALB, Grafana) amortize theo số service → per-service cost giảm dần.*
+Bảng dưới đây minh họa rõ lý do tại sao kiến trúc này tối ưu ở quy mô lớn thay vì quy mô nhỏ. Khi N tăng, Fixed Cost được khấu hao (amortized), giúp giảm mạnh chi phí trung bình.
+
+| Tenant count | Monthly total cost | Avg per-tenant | Ghi chú kiến trúc |
+| --- | --- | --- | --- |
+| **3 (Current)** | **$179.92** | **$59.97** | Bị áp đảo bởi base cost của VPC Endpoints & Kinesis |
+| 10 | ~$185.00 | $18.50 | Timestream storage/query tăng nhẹ, Core Infra giữ nguyên |
+| 50 | ~$210.00 | $4.20 | Đạt điểm hiệu quả chi phí. Kinesis có thể cần thêm shard |
+| 200 | ~$350.00 | $1.75 | Tiệm cận target NFR ban đầu |
+
+< TODO W12: Nếu biến phí Kinesis PUT / Timestream Query Scan tăng đáng kể khi N tăng qua các bài stress test, cần cập nhật lại forecast cho N=50 và N=200 >
 
 ## 3. Cost optimization applied
 
-- [ ] Fargate Spot cho ingest layer (non-critical) → ~70% saving vs on-demand
-- [ ] Lambda cho AI engine nếu request rate thấp (pay-per-invocation, zero idle)
-- [ ] S3 lifecycle: Standard (30 ngày) → IA (90 ngày) → Glacier (1 năm)
-- [ ] Timestream: Data retention split - memory store 7 ngày, magnetic store 90 ngày
-- [ ] CloudWatch log retention: 14 ngày (không giữ forever)
-- [ ] VPC endpoints thay NAT Gateway → tiết kiệm $0.045/GB data processing
-- [ ] Bedrock prompt caching (nếu AI team support) → reduce token cost repeat prompts
-- [ ] Right-sizing: Lambda 256MB → 512MB nếu CPU-bound (benchmark trước)
+☐ Spot instances cho non-critical workload (Có thể áp dụng cho Load Generation task để giảm $22.83)
+☐ Reserved capacity cho baseline AI Engine
+☑ **S3 lifecycle tiering:** Standard → IA sau 30 ngày cho Audit Logs ($0.50/tháng).
+☐ DynamoDB on-demand vs provisioned (Không áp dụng, dùng Timestream)
+☐ Bedrock prompt caching (Không áp dụng theo constraint: Không sử dụng LLM)
+☐ Right-sizing per ECS task/Lambda memory
+☑ **Log retention tiering:** CloudWatch retention giới hạn 7 ngày ($8.11).
+☑ **Data transfer optimization:** Kết nối private qua VPC Endpoints thay vì NAT Gateway ($41.50). Mặc dù base cost cao nhưng chặn đứng hoàn toàn phí Data Processing của NAT.
 
-## 4. Cost vs alternatives (cùng TF4)
+## 4. Measured actual (Pack #2 only - fill in W12)
 
-<!-- TODO: Điền sau khi biết angle của 2 CDO còn lại (T3 W11) -->
-
-| Angle | $/service/month forecast | Why different |
-|---|---|---|
-| CDO-07: `< TODO angle >` | `$N` | `< TODO lý do >` |
-| CDO-XX: TBD | TBD | TBD |
-| CDO-YY: TBD | TBD | TBD |
-
-## 5. Measured actual (W12 T4 - fill sau khi build)
-
-### 5.1 2-week capstone actual spend
-
-<!-- Lấy từ AWS Cost Explorer sau code freeze T4 W12 -->
+### 4.1 2-week capstone spend
 
 | Service | Forecast | Actual | Delta |
-|---|---|---|---|
-| Compute | $X | — | — |
-| Time-series storage | $X | — | — |
-| S3 | $X | — | — |
-| AI inference (Bedrock) | $X | — | — |
-| CloudWatch / observability | $X | — | — |
-| Data transfer | $X | — | — |
-| **Total** | **$X** | **—** | **—** |
+| --- | --- | --- | --- |
+| Compute | $34.08 | $X | ±X% |
+| Database (Timestream) | $28.50 | $X | ±X% |
+| Storage / Streaming | $43.70 | $X | ±X% |
+| Networking / API | $59.93 | $X | ±X% |
+| Observability | $17.11 | $X | ±X% |
+| **Total** | **$179.92** | **$X** | **±X%** |
 
-### 5.2 Per-service actual (3 test services)
+### 4.2 Per-tenant actual
 
-| Service | Load profile | $/day measured | Extrapolate $/month |
-|---|---|---|---|
-| payment-gateway | medium (synthetic) | — | — |
-| kyc-service | low | — | — |
-| reporting-service | batch-heavy | — | — |
+| Tenant test | Service mix | $/day | Extrapolate $/month |
+| --- | --- | --- | --- |
+| **Tenant-1** | `payment-gateway` | $X | $X |
+| **Tenant-2** | `kyc-service` | $X | $X |
+| **Tenant-3** | `reporting-api` | $X | $X |
 
-### 5.3 Cost-per-correct-prediction (joint với AI eval)
+### 4.3 Cost-per-correct-decision (joint with AI eval)
 
 | Metric | Value |
-|---|---|
-| Total Bedrock calls trong capstone | — |
-| Correct predictions (AI eval report) | — |
-| Total AI inference cost | — |
-| **Cost per correct prediction** | **—** |
+| --- | --- |
+| Total AI calls in capstone | N |
+| Correct decisions | M |
+| Total AI inference cost (ECS Fargate fraction) | $11.25 |
+| **Cost per correct decision** | **$11.25 / M** |
 
-*Cross-reference: [`../../ai/docs/04_eval_report.md`](../../ai/docs/04_eval_report.md) §3*
+## 5. Cost guardrails (Risk Warning)
 
----
+* **Nguy cơ cấu trúc (Architectural Risk):** Hệ thống đang set AWS Budgets alert ở mức **$180**. Với dự phóng chi phí là **$179.92**, mức đệm (buffer) hiện tại chỉ là **$0.08**.
+* **Hành động:** Lambda circuit breaker qua SSM sẽ bị trigger ngay lập tức chỉ với một đợt traffic spike nhỏ. Cần điều chỉnh Alert threshold lên $195 hoặc tối ưu Fargate Load Gen xuống mức thấp hơn.
+* **Per-tenant quota enforced via API rate limit:** Đang triển khai tại Kinesis shard limits (partition key = `service_id`).
 
-## 6. Cost guardrails
+## 6. Cost recommendations for production
 
-- **Budget alert**: CloudWatch Budget alarm tại 70% ($140), 90% ($180), 100% ($200)
-- **Per-service quota**: rate limit X req/min/service tại AI engine layer
-- **Bedrock daily spend cap**: CloudWatch alarm `bedrock:InvokeModel` cost > $10/day
-- **Auto-shutdown sandbox**: EventBridge rule tắt Fargate tasks ngoài giờ build (22h-8h) để tiết kiệm
-
----
-
-## 7. Cost recommendations cho production
-
-- Reserved capacity (Fargate Compute Savings Plan) sau 3 tháng usage baseline
-- Migrate từ Managed Grafana → self-hosted Grafana nếu scale > 50 services (break-even ~$X)
-- Timestream magnetic store cho historical data > 90 ngày thay vì S3 + Athena (benchmark cần)
-
----
+* **Fargate Compute Savings Plan:** Cam kết 1-3 năm sẽ giúp giảm 20-50% chi phí cho AI Engine và Load Gen.
+* **Kinesis On-Demand:** Cân nhắc chuyển Kinesis Data Streams sang mode On-Demand nếu traffic thực tế của 3 tenants có tính chất bursty (thất thường) và idle nhiều.
+* **Self-managed VPC Endpoints (Gateway vs Interface):** Chuyển S3 Endpoint sang dạng Gateway (Miễn phí) thay vì Interface để tiết kiệm hourly cost.
 
 ## Related documents
 
-- [`02_infra_design.md`](02_infra_design.md) - Infra decisions drive compute/storage cost
-- [`07_test_eval_report.md`](07_test_eval_report.md) - Load test validates throughput assumptions
-- [`../../ai/docs/03_ai_engine_spec.md`](../../ai/docs/03_ai_engine_spec.md) §7 - AI inference cost per call
+* `02_infra_design.md` - Phân tích kiến trúc gốc tạo ra mức phí $179.92.
+* `08_ai_api_contract.md §Rate limiting` - Quota guardrail feeds row "Per-tenant quota".
+* `07_test_report.md` - Load test results validate Timestream Query Scan assumptions.
