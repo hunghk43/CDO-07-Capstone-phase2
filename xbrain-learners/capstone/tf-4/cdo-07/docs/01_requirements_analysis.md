@@ -27,13 +27,13 @@ Xây dựng một hệ thống phân tích và dự báo chuỗi thời gian (ti
 
 | Chỉ số NFR | Ngưỡng Mục tiêu (Target) | Khung Lý do & Ràng buộc Kỹ thuật (Justification) |
 | :--- | :--- | :--- |
-| **Multi-tenant scale** | ≥ 50 tenants | Hệ thống được thiết kế để đóng gói thành sản phẩm thương mại hóa (SaaS), cho phép quản lý và cô lập dữ liệu metric từ tối thiểu 50 tenant khách hàng khác nhau. |
+| **Multi-tenant scale** | ≥ 3 tenant được thiết kế để đóng gói thành sản phẩm thương mại hóa (SaaS), cho phép quản lý và cô lập dữ liệu metric từ tối thiểu 3 tenant khác nhau. |
 | **SLO p99 latency** | < 1000ms | Áp dụng nghiêm ngặt cho điểm cuối API `/v1/predict`. Thời gian xử lý từ lúc nhận payload time-series window đến khi trả về kết quả dự báo không được quá 1 giây để bảo toàn thời gian xử lý sự cố. |
 | **Availability** | ≥ 99.5% | Cam kết độ sẵn sàng ổn định cho toàn bộ pipeline ingestion và hệ thống lưu trữ dữ liệu giám sát cốt lõi, đảm bảo không làm đứt gãy luồng metric truyền về. |
 | **Error rate** | < 0.5% | Tỷ lệ lỗi sinh ra trên đường truyền dẫn dữ liệu (drop metric, network error) phải được kiểm soát dưới 0.5% để tránh làm sai lệch tập dữ liệu đầu vào của mô hình AI. |
-| **Cost per tenant/month** | ~$1.90 / tenant | Dựa trên mục tiêu phân bổ ngân sách tối ưu của dự án, tổng chi phí hạ tầng AWS duy trì ở mức ~$95/tháng. Với quy mô tối thiểu 50 tenants, chi phí trên mỗi tenant cực kỳ cạnh tranh. |
+| **Cost per tenant/month** | ~$1.90 / tenant | Dựa trên mục tiêu phân bổ ngân sách tối ưu của dự án, tổng chi phí cho mỗi tenent vào khoảng $1.9 |
 | **Onboarding SLA** | < 30 phút | Thời gian từ lúc một microservice mới được đăng ký vào hệ thống Foresight Lens cho đến khi hạ tầng lưu trữ và phân tách dữ liệu sẵn sàng tiếp nhận metric. |
-| **Security baseline** | IAM least-privilege + audit 90 ngày | Toàn bộ các dịch vụ AWS cấu hình chặt chẽ qua IAM Roles, mã hóa dữ liệu tại chỗ (Encryption at rest) và lưu vết toàn bộ hoạt động truy cập thông qua CloudTrail để đáp ứng chuẩn SOC2. |
+| **Security baseline** | IAM least-privilege + audit 90 ngày | Toàn bộ các dịch vụ AWS cấu hình chặt chẽ qua IAM Roles, mã hóa dữ liệu tại chỗ (Encryption at rest).|
 
 ---
 
