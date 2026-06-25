@@ -111,7 +111,7 @@ Key architectural decisions:
 ## 6. Scaling strategy
 
 - **Vertical**: ECS auto-scaling CPU >70% for 2 minutes → launch additional task
-- **Horizontal**: Kinesis On-Demand mode auto add/remove shards theo traffic spikes
+- **Horizontal**: Kinesis Data Streams được khóa cứng ở **Provisioned Mode (3 Shards)** để thiết lập trần chi phí (Cost Cap) và bảo vệ ngân sách khỏi bão traffic bất thường. Scaling sẽ được handle qua cơ chế Backpressure tại producer thay vì auto-scale hạ tầng.
 - **Triggers**: CloudWatch alarms - ECS CPU utilization, Kinesis incoming records, Lambda error rates
 
 ## 7. Failure modes + recovery
