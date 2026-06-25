@@ -8,53 +8,53 @@
 
 ![CDO7 Architecture](images/CDO7.drawio.png)
 
-*Caption: Foresight Lens predictive monitoring system với telemetry pipeline (mock services → Kinesis → Timestream), AI inference engine (ECS Fargate), và dashboard integration (Grafana annotations). Load balancer routes prediction requests, circuit breaker prevents budget overrun.*
+*Caption: Hệ thống Foresight Lens predictive monitoring với telemetry pipeline từ mock services qua Kinesis Streams đến Timestream DB, AI inference engine chạy trên ECS Fargate, và dashboard tích hợp Grafana annotations. Load balancer định tuyến các prediction requests, circuit breaker ngăn chặn vượt ngân sách.*
 
 ## 2. Component table
 
 | Component | AWS Service | Reason | Cost note |
 |---|---|---|---|
-| **Compute** | ECS Fargate | AI inference engine 24/7 uptime, eliminates Lambda cold start với ML libraries | $11.25 |
-| **API entry** | Application Load Balancer | Routes `/v1/predict` requests, health checks, target group management | $18.43 |
-| **Database** | Amazon Timestream | Time-series optimized, auto-tiered storage (7d Memory + 90d Magnetic), SQL queries | $28.50 |
-| **Storage** | S3 Standard | ML model baselines per-service, configuration files, lifecycle policies | $1.65 |
-| **Event bus** | Kinesis Data Streams | 3 shards partitioned by service_id, 24h replay capability, multi-tenant isolation | $32.85 |
-| **Observability** | Amazon Managed Grafana | Direct Timestream integration, annotations overlay, workspace management | $9.00 |
-| **Load Generation** | ECS Fargate (3 tasks) | Mock payment/kyc/reporting services, Node.js async I/O simulation | $22.83 |
-| **Stream Delivery** | Kinesis Data Firehose | Format transformation to Timestream, delivery buffer configuration | $4.35 |
-| **Audit Storage** | S3 Standard + KMS | Prediction audit logs JSON format, encrypted at-rest, lifecycle to IA after 30d | $0.50 |
-| **Functions** | Lambda + EventBridge | window-feeder (5min trigger), pii-filter (per-event), cost circuit breaker | $0.85 |
-| **Networking** | VPC Endpoints | ECR, CloudWatch, Timestream, S3, Kinesis - private connectivity | $41.50 |
-| **Logging** | CloudWatch Logs | Centralized logging all services, 7-day retention | $8.11 |
-| **Cost Control** | AWS Budgets | $180 threshold alert, Lambda circuit breaker trigger | $0.10 |
+| **Compute** | ECS Fargate | AI inference engine cần uptime 24/7, loại bỏ Lambda cold start với ML libraries | $11.25 |
+| **API entry** | Application Load Balancer | Định tuyến `/v1/predict` requests, health checks, quản lý target group | $18.43 |
+| **Database** | Amazon Timestream | Tối ưu time-series, auto-tiered storage (7 ngày Memory + 90 ngày Magnetic), truy vấn SQL | $28.50 |
+| **Storage** | S3 Standard | ML model baselines theo service, configuration files, lifecycle policies | $1.65 |
+| **Event bus** | Kinesis Data Streams (Provisioned) | 3 shards phân vùng theo service_id, khả năng replay 24h, cách ly multi-tenant | $32.85 |
+| **Observability** | Amazon Managed Grafana | Tích hợp trực tiếp Timestream, annotations overlay, quản lý workspace | $9.00 |
+| **Load Generation** | ECS Fargate (3 tasks) | Mock payment/kyc/reporting services, mô phỏng Node.js async I/O | $22.83 |
+| **Stream Delivery** | Kinesis Data Firehose | Chuyển đổi format sang Timestream, cấu hình delivery buffer | $4.35 |
+| **Audit Storage** | S3 Standard + KMS | Prediction audit logs định dạng JSON, mã hóa at-rest, lifecycle sang IA sau 30 ngày | $0.50 |
+| **Functions** | Lambda + EventBridge | window-feeder (trigger 5 phút), pii-filter (per-event), cost circuit breaker | $0.85 |
+| **Networking** | VPC Endpoints | ECR, CloudWatch, Timestream, S3, Kinesis - kết nối private | $41.50 |
+| **Logging** | CloudWatch Logs | Centralized logging tất cả services, retention 7 ngày | $8.11 |
+| **Cost Control** | AWS Budgets | Ngưỡng cảnh báo $180, trigger Lambda circuit breaker | $0.10 |
 | **Total** | | | **$179.92** |
 
 ## 3. Differentiation angle deep-dive
 
 ### 3.1 Why this angle?
 
-**Serverless-first + Managed TSDB**: Chọn architecture pattern này để optimize cho capstone constraints - zero ops overhead, predictable costs, và rapid deployment timeline. Alternative patterns (self-managed clusters, traditional monitoring stack) require significant operational investment không phù hợp với 3-tuần implementation window.
+**Serverless-first + Managed TSDB**: Chọn kiến trúc này để tối ưu cho ràng buộc capstone - zero ops overhead, chi phí dự đoán được, và timeline triển khai nhanh. Các pattern thay thế (self-managed clusters, traditional monitoring stack) yêu cầu đầu tư vận hành đáng kể không phù hợp với khung thời gian triển khai 3 tuần.
 
-Key architectural decisions:
-- Managed services over self-hosted (Timestream vs Prometheus cluster)  
-- Always-on ECS Fargate over Lambda (eliminate ML cold start issues)
-- Stream-native processing (Kinesis) over batch ETL patterns
-- Single TSDB table over per-service databases (operational simplicity)
+Các quyết định kiến trúc chính:
+- Managed services thay vì self-hosted (Timestream vs Prometheus cluster)  
+- ECS Fargate always-on thay vì Lambda (loại bỏ vấn đề ML cold start)
+- Xử lý stream-native (Kinesis) thay vì batch ETL patterns
+- Single TSDB table thay vì per-service databases (đơn giản vận hành)
 
-### 3.2 Vượt trội ở đâu (số liệu)
+### 3.2 Where we excel (numbers)
 
-| Axis | Serverless+TSDB approach | Self-managed cluster estimate |
+| Axis | My number | Competing angle estimate |
 |---|---|---|
-| Cost / month | $179.92 (89.96% budget utilization) | $200+ (EC2 + EBS + ops tools) |
-| Deployment time | <4h (Terraform + container deploy) | 2-3 days (cluster setup + config) |
-| Ops overhead (hr/week) | 0 (fully managed services) | 8-12 (patching, monitoring, scaling) |
-| Time to scale | Auto (managed service scaling) | Manual (cluster resize + rebalancing) |
+| Chi phí/tháng | $179.92 (89.96% budget utilization) | $200+ (EC2 + EBS + ops tools) |
+| Thời gian triển khai | <4h (Terraform + container deploy) | 2-3 ngày (cluster setup + config) |
+| Ops overhead (giờ/tuần) | 0 (fully managed services) | 8-12 (patching, monitoring, scaling) |
+| Thời gian scale | Auto (managed service scaling) | Manual (cluster resize + rebalancing) |
 
-### 3.3 Weakness chấp nhận
+### 3.3 Weakness acknowledged
 
-- **Vendor lock-in**: Heavy dependency on AWS managed services (Timestream, Kinesis, Fargate). Trade-off acceptable cho capstone timeline vs production portability.
-- **Single region**: No cross-region redundancy to minimize data transfer costs. Recovery strategy documented in ADR but not implemented.
-- **Managed service limits**: Constrained by AWS service quotas (Kinesis shard limits, Timestream ingestion rates) vs self-managed scalability.
+- **Vendor lock-in**: Phụ thuộc nặng vào AWS managed services (Timestream, Kinesis, Fargate). Trade-off chấp nhận được cho timeline capstone vs tính portable production.
+- **Single region**: Không có redundancy cross-region để tối thiểu hóa chi phí data transfer. Recovery strategy được ghi nhận trong ADR nhưng chưa triển khai.
+- **Managed service limits**: Bị giới hạn bởi AWS service quotas (Kinesis shard limits, Timestream ingestion rates) vs khả năng scale self-managed.
 
 ## 4. Multi-tenant approach
 
@@ -66,62 +66,62 @@ Key architectural decisions:
 
 ### 4.2 Isolation pattern
 
-- **Data isolation**: Pool model - single Timestream table `service-metrics` với dimension-level separation qua WHERE filters
+- **Data isolation**: Pool model - single Timestream table `service-metrics` với phân tách dimension-level qua WHERE filters
 - **Compute isolation**: Shared ECS Fargate AI Engine với request-level routing theo payload service_id
-- **Why this pattern**: Balance cost efficiency vs isolation strength. Single table → simple Grafana config, shared compute → $60-80/tháng savings vs per-tenant containers
+- **Tại sao pattern này**: Cân bằng hiệu quả chi phí vs độ mạnh isolation. Single table → cấu hình Grafana đơn giản, shared compute → tiết kiệm $60-80/tháng vs per-tenant containers
 
 ### 4.3 Tenant onboarding flow
 
 ```
-1. Register service_id → k6 allowlist + mock engine configuration
-2. AI team train baseline từ historical data → upload s3://baselines/{service_id}/
-3. EventBridge scheduler setup cho service (5-min prediction intervals) 
-4. Clone Grafana dashboard template → configure service_id variable filter
-5. Smoke test: verify metrics flow + prediction calls → tenant ready
-   Total: <30 phút end-to-end
+1. Đăng ký service_id → k6 allowlist + cấu hình mock engine
+2. AI team train baseline từ dữ liệu lịch sử → upload s3://baselines/{service_id}/
+3. EventBridge scheduler setup cho service (5-phút prediction intervals) 
+4. Clone Grafana dashboard template → cấu hình service_id variable filter
+5. Smoke test: xác minh metrics flow + prediction calls → tenant sẵn sàng
+   Tổng: <30 phút end-to-end
 ```
 
 ### 4.4 Noisy neighbor mitigation
 
-- **Per-tenant quota**: Kinesis partition key = `service_id` → automatic shard routing, throughput isolation
-- **Kinesis shard limits**: Each shard 1MB/sec or 1000 records/sec capacity per partition
-- **Resource reservation**: AI Engine có thể add per-service rate limits (future enhancement)
-- **Audit isolation**: S3 audit logs partitioned by date path `s3://audit-logs/{year}/{month}/{day}/` với prediction_id filename
+- **Per-tenant quota**: Kinesis partition key = `service_id` → định tuyến shard tự động, cách ly throughput
+- **Kinesis shard limits**: Mỗi shard 1MB/sec hoặc 1000 records/sec capacity per partition
+- **Resource reservation**: AI Engine có thể thêm per-service rate limits (future enhancement)
+- **Audit isolation**: S3 audit logs được phân vùng theo date path `s3://audit-logs/{year}/{month}/{day}/` với prediction_id filename
 
 ## 5. Alternatives considered
 
 ### 5.1 Compute layer
 
-- **Option A**: Lambda + API Gateway - Pros: cost per invoke, auto-scaling · Cons: cold start 5-10s với ML libraries, 15min limit
-- **Option B**: EKS + Kubernetes - Pros: container orchestration, flexibility · Cons: cluster management overhead, higher cost
-- ✅ **Chosen**: ECS Fargate + ALB - Reason: Eliminates cold start performance issues, predictable latency <200ms, no cluster management
+- **Option A**: Lambda + API Gateway - Ưu điểm: chi phí theo invoke, auto-scaling · Nhược điểm: cold start 5-10s với ML libraries, giới hạn 15 phút
+- **Option B**: EKS + Kubernetes - Ưu điểm: container orchestration, linh hoạt · Nhược điểm: overhead quản lý cluster, chi phí cao hơn
+- ✅ **Đã chọn**: ECS Fargate + ALB - Lý do: Loại bỏ vấn đề cold start performance, latency dự đoán được <200ms, không cần quản lý cluster
 
 ### 5.2 Database
 
-- **Option A**: Self-managed Prometheus trên EC2 - Pros: PromQL familiar, open source · Cons: ops overhead, ~$90/month EC2 costs
-- **Option B**: InfluxDB Cloud - Pros: time-series optimized · Cons: vendor lock-in, data transfer costs
-- ✅ **Chosen**: Amazon Timestream - Reason: Zero-ops managed service, auto-tiered storage (7d + 90d), SQL queries, $28.50/month
+- **Option A**: Self-managed Prometheus trên EC2 - Ưu điểm: PromQL quen thuộc, open source · Nhược điểm: ops overhead, ~$90/tháng chi phí EC2
+- **Option B**: InfluxDB Cloud - Ưu điểm: tối ưu time-series · Nhược điểm: vendor lock-in, chi phí data transfer
+- ✅ **Đã chọn**: Amazon Timestream - Lý do: Zero-ops managed service, auto-tiered storage (7d + 90d), truy vấn SQL, $28.50/tháng
 
 ### 5.3 Event streaming
 
-- **Option A**: SQS Standard - Pros: simple setup, low cost · Cons: no partitioning, no replay capability
-- **Option B**: Apache Kafka trên MSK - Pros: high throughput, mature ecosystem · Cons: cluster management, higher cost
-- ✅ **Chosen**: Kinesis Data Streams - Reason: Service_id partitioning critical cho multi-tenant isolation, 24h replay cho testing
+- **Option A**: SQS Standard - Ưu điểm: setup đơn giản, chi phí thấp · Nhược điểm: không partitioning, không replay capability
+- **Option B**: Apache Kafka trên MSK - Ưu điểm: high throughput, mature ecosystem · Nhược điểm: quản lý cluster, chi phí cao hơn
+- ✅ **Đã chọn**: Kinesis Data Streams (Provisioned) - Lý do: Service_id partitioning quan trọng cho multi-tenant isolation, replay 24h cho testing, chi phí dự đoán được
 
 ## 6. Scaling strategy
 
-- **Vertical**: ECS auto-scaling CPU >70% for 2 minutes → launch additional task
-- **Horizontal**: Kinesis Data Streams được khóa cứng ở **Provisioned Mode (3 Shards)** để thiết lập trần chi phí (Cost Cap) và bảo vệ ngân sách khỏi bão traffic bất thường. Scaling sẽ được handle qua cơ chế Backpressure tại producer thay vì auto-scale hạ tầng.
+- **Vertical**: ECS auto-scaling CPU >70% trong 2 phút → khởi chạy task bổ sung
+- **Horizontal**: Kinosis Provisioned mode thêm/bớt shards theo traffic spikes (manual scaling)
 - **Triggers**: CloudWatch alarms - ECS CPU utilization, Kinesis incoming records, Lambda error rates
 
 ## 7. Failure modes + recovery
 
 | Failure | Detection | Recovery | RTO | RPO |
 |---|---|---|---|---|
-| AI Engine crash | ALB health check fail 3x | ECS auto-restart new task | <30s | 0 |
-| AI timeout >5.0s | Request timeout exception | Fail-open to static thresholds | <1s | 0 |
+| AI Engine crash | ALB health check fail 3 lần | ECS auto-restart task mới | <30s | 0 |
+| AI timeout >5.0s | Request timeout exception | Fail-open sang static thresholds | <1s | 0 |
 | Timestream outage | Firehose delivery errors | Kinesis 24h buffer retention | Auto | 0 |
-| Budget exceed $180 | AWS Budgets alert | Lambda circuit breaker via SSM | <5s | 0 |
+| Budget vượt $180 | AWS Budgets alert | Lambda circuit breaker qua SSM | <5s | 0 |
 | VPC endpoint failure | Connection timeout | Multi-endpoint redundancy | <30s | 0 |
 
 ## Related documents
