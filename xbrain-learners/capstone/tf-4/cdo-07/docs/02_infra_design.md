@@ -1,4 +1,4 @@
-# Infrastructure Design - Task Force 4 · CDO 7
+# Infrastructure Design - Task Force 4 · CDO-07
 
 <!-- Doc owner: Nhóm CDO7
      Status: Draft (W11 T3-T4) → Final (W11 T6 Pack #1) → Updated (W12 T4 Pack #2)
@@ -17,7 +17,7 @@
 | **Compute** | ECS Fargate | AI inference engine 24/7 uptime, eliminates Lambda cold start với ML libraries | $11.25 |
 | **API entry** | Application Load Balancer | Routes `/v1/predict` requests, health checks, target group management | $18.43 |
 | **Database** | Amazon Timestream | Time-series optimized, auto-tiered storage (7d Memory + 90d Magnetic), SQL queries | $28.50 |
-| **Storage** | S3 Standard | ML model baselines per-service, audit logs JSON (encrypted KMS), configuration files | $2.15 |
+| **Storage** | S3 Standard | ML model baselines per-service, configuration files, lifecycle policies | $1.65 |
 | **Event bus** | Kinesis Data Streams | 3 shards partitioned by service_id, 24h replay capability, multi-tenant isolation | $32.85 |
 | **Observability** | Amazon Managed Grafana | Direct Timestream integration, annotations overlay, workspace management | $9.00 |
 | **Load Generation** | ECS Fargate (3 tasks) | Mock payment/kyc/reporting services, Node.js async I/O simulation | $22.83 |
@@ -27,8 +27,7 @@
 | **Networking** | VPC Endpoints | ECR, CloudWatch, Timestream, S3, Kinesis - private connectivity | $41.50 |
 | **Logging** | CloudWatch Logs | Centralized logging all services, 7-day retention | $8.11 |
 | **Cost Control** | AWS Budgets | $180 threshold alert, Lambda circuit breaker trigger | $0.10 |
-| **Total** | | | **$178.42** |
-## 3. Differentiation angle deep-dive
+| **Total** | | | **$179.92** |
 
 ## 3. Differentiation angle deep-dive
 
@@ -46,7 +45,7 @@ Key architectural decisions:
 
 | Axis | Serverless+TSDB approach | Self-managed cluster estimate |
 |---|---|---|
-| Cost / month | $178 (89% budget utilization) | $200+ (EC2 + EBS + ops tools) |
+| Cost / month | $179.92 (89.96% budget utilization) | $200+ (EC2 + EBS + ops tools) |
 | Deployment time | <4h (Terraform + container deploy) | 2-3 days (cluster setup + config) |
 | Ops overhead (hr/week) | 0 (fully managed services) | 8-12 (patching, monitoring, scaling) |
 | Time to scale | Auto (managed service scaling) | Manual (cluster resize + rebalancing) |
@@ -85,7 +84,7 @@ Key architectural decisions:
 ### 4.4 Noisy neighbor mitigation
 
 - **Per-tenant quota**: Kinesis partition key = `service_id` → automatic shard routing, throughput isolation
-- **Rate limiting**: AWS WAF 10k req/5min per source IP trên ALB  
+- **Kinesis shard limits**: Each shard 1MB/sec or 1000 records/sec capacity per partition
 - **Resource reservation**: AI Engine có thể add per-service rate limits (future enhancement)
 - **Audit isolation**: S3 audit logs partitioned by date path `s3://audit-logs/{year}/{month}/{day}/` với prediction_id filename
 
@@ -112,7 +111,7 @@ Key architectural decisions:
 ## 6. Scaling strategy
 
 - **Vertical**: ECS auto-scaling CPU >70% for 2 minutes → launch additional task
-- **Horizontal**: Kinesis On-Demand mode auto add/remove shards theo traffic spikes
+- **Horizontal**: Kinesis Data Streams được khóa cứng ở **Provisioned Mode (3 Shards)** để thiết lập trần chi phí (Cost Cap) và bảo vệ ngân sách khỏi bão traffic bất thường. Scaling sẽ được handle qua cơ chế Backpressure tại producer thay vì auto-scale hạ tầng.
 - **Triggers**: CloudWatch alarms - ECS CPU utilization, Kinesis incoming records, Lambda error rates
 
 ## 7. Failure modes + recovery
@@ -130,5 +129,5 @@ Key architectural decisions:
 - [`01_requirements_analysis.md`](01_requirements_analysis.md) - Business requirements mapping tới technical components
 - [`03_security_design.md`](03_security_design.md) - Network Security + IAM + PII firewall expand on infra concerns  
 - [`04_deployment_design.md`](04_deployment_design.md) - IaC Terraform + CI/CD GitOps cho infra này
-- [`05_cost_analysis.md`](05_cost_analysis.md) - Per-service cost model $179/tháng breakdown chi tiết + optimization strategies
+- [`05_cost_analysis.md`](05_cost_analysis.md) - Per-service cost model $179.92/tháng breakdown chi tiết + optimization strategies
 - [`08_adrs.md`](08_adrs.md) - Infra architecture decisions (ADR-001 to ADR-004)

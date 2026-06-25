@@ -28,21 +28,27 @@
 
 ---
 
-## ADR-001 - Infra angle: Event-driven hybrid (ECS Fargate + SQS + Timestream + Grafana OSS)
-
+## ADR-001 - Infra angle: Event-driven hybrid (ECS Fargate + Kinesis + Timestream + Amazon Managed Grafana)
 - **Status**: Accepted
-- **Date**: 2026-06-23
+- **Date**: 2026-06-23 (Updated 2026-06-25)
 - **Context**: TF4 yêu cầu ingest high-volume time-series từ 3 tier-1 service, AI engine
   predict drift với lead time ≥15 phút, Grafana annotation overlay, budget $200/2 tuần.
   Serverless-first (ADR-000) bị loại vì AMP pull-based không match push-ingest và Lambda
   không giữ được Circuit Breaker state. CDO-07 cần angle khác biệt so với 2 CDO còn lại.
-- **Decision**: Chọn **event-driven hybrid**: k6 → WAF → ALB → Ingest Service → SQS →
-  Ingest Worker → Timestream. AI Serving trên ECS Fargate, EventBridge trigger mỗi 5 phút,
-  output qua Grafana OSS annotation + SNS → Slack. Audit log ghi S3 SSE-KMS.
+- **Decision**: Chọn **event-driven** hybrid: k6 → ALB → mock services emit metric →
+  Kinesis Data Streams (3 shards) → Kinesis Firehose → Lambda Transformer (PII drop) →
+  Timestream. AI Serving trên ECS Fargate, EventBridge trigger mỗi 5 phút qua Lambda
+  Window Feeder (query 2h window, gọi /v1/predict, timeout 5.0s), có Fail-Open Fallback
+  (static thresholds) khi AI timeout, và SSM Param Store làm toggle inference_enabled
+  cho cost circuit breaker (Lambda CB, xem mục 7 + component table trong 02_infra_design.md).
+  Output qua Amazon Managed Grafana annotation + SNS → Slack. Audit log ghi S3 SSE-KMS.
 - **Consequence**:
-  - SQS buffer absorb traffic spike (sudden spike 3× scenario) mà không drop metric
+  - Kinesis Data Streams buffer + absorb traffic spike (sudden spike 3× scenario) mà
+  không drop metric, đồng thời partition theo service_id cho multi-tenant isolation
+  và có 24h replay capability cho testing (xem 02_infra_design.md mục 4.4)
   - ECS Fargate giữ Circuit Breaker state liên tục, không cold start
-  - Grafana OSS self-hosted: không tốn AMG license $9/user/month, full control annotation API
+  - Amazon Managed Grafana: tích hợp trực tiếp Timestream plugin, không cần tự quản lý server/version/availability của Grafana — đổi lại tốn license $9/workspace/month so với self-host, nhưng giảm ops overhead phù hợp timeline 3 tuần
+  - Lambda Window Feeder + Fail-Open Fallback + SSM toggle thêm 1 lớp resilience: khi AI Engine timeout hoặc bị tắt qua cost circuit breaker, hệ thống fail-open sang static thresholds (CPU>85%, Mem>90%, Conn>450, Queue>10k) thay vì mất giám sát hoàn toàn
   - Nhiều component hơn serverless-first: tăng surface area debug trong 6 ngày W12
   - Timestream SQL syntax khác PromQL: cần sync với AI team trong Telemetry Contract
 - **Alternatives considered**:
@@ -96,22 +102,45 @@
 
 ---
 
-## ADR-004 - Queue/decoupling: SQS giữa Ingest Service và Ingest Worker
+## ADR-004 - Ingestion pipeline: Kinesis Data Streams + Firehose giữa Mock Services và Timestream
 
-- **Status**: Accepted
+- **Status**: Accepted (Updated 2026-06-25 — xem ghi chú Update trong ADR-001)
 - **Date**: 2026-06-23
-- **Context**: Ingest Service nhận telemetry từ 3 tier-1 service qua ALB path `/v1/telemetry` (push pattern, HTTPS POST qua WAF). Test scenario yêu cầu chịu được sudden spike 3× traffic mà không drop metric. Nếu Ingest Service write trực tiếp và đồng bộ vào Timestream, một traffic spike sẽ block request hoặc gây timeout, vì Timestream BatchWrite cần batch 100 records/call để tối ưu throughput và cost — không phù hợp ghi single-record theo từng request đến.
-- **Decision**: Tách **Ingest Service** (nhận request, enqueue vào SQS) và **Ingest Worker** (poll + batch từ SQS, BatchWrite 100 records/call vào Timestream) thành 2 service riêng trên ECS Fargate, decouple qua **Amazon SQS**. Ingest Worker và AI Serving đều poll SQS qua VPC Endpoint (không ra Internet).
-- **Consequence**:
-  - SQS đóng vai trò buffer, absorb traffic spike (sudden spike 3× scenario) mà không làm Ingest Service bị nghẽn hoặc drop request
-  - Ingest Worker có thể batch 100 records/call trước khi write Timestream — tối ưu cost và throughput so với write từng record
-  - Tách compute write nặng (Ingest Worker) khỏi compute nhận request (Ingest Service) — scale độc lập theo queue depth hoặc theo request rate
-  - Thêm độ trễ giữa lúc nhận request và lúc data thực sự có trong Timestream (do enqueue → poll → batch), cần đảm bảo độ trễ này vẫn nằm trong khoảng cho phép so với lead time ≥15 phút của AI Serving
-  - SQS không đảm bảo exactly-once theo mặc định — Ingest Worker retry khi poll lại có thể gây duplicate ghi cùng timestamp vào Timestream (Timestream không support upsert, đã ghi nhận ở ADR-002) → cần idempotency check ở Ingest Worker
-  - Thêm 1 component vào kiến trúc (so với write trực tiếp), tăng surface area cần debug nếu message bị stuck hoặc vào Dead Letter Queue
+- **Context**: 3 mock service (Payment GW, Ledger, Fraud detection) liên tục bắn metric ra ngoài.
+  Nếu cứ để chúng ghi thẳng vào Timestream, một traffic spike (test scenario yêu cầu chịu
+  được spike 3×) sẽ làm nghẽn hoặc rớt metric vì Timestream cần ghi theo batch mới tối
+  ưu, không hợp để ghi từng record lẻ tẻ ngay khi nó tới. Ngoài ra, theo mục 4.4 của
+  02_infra_design.md, mỗi service cần được cách ly throughput với nhau (multi-tenant), và
+  team cũng muốn có khả năng replay lại data trong 24h để debug khi cần, vì timeline W12
+  chỉ có 6 ngày để build nên không có nhiều cơ hội tái tạo lại sự cố thủ công.
+- **Decision**: Cho mock service bắn metric vào **Kinesis Data Streams** (3 shard, dùng
+  `service_id` làm partition key), từ đó chảy qua **Kinesis Firehose** (buffer 60 giây)
+  tới **Lambda Transformer**. Lambda này làm 2 việc trong 1 bước: định dạng lại data cho
+  đúng schema Timestream, và lọc field nhạy cảm (PII) trước khi ghi. Sau đó mới ghi vào
+  Timestream. Luồng này hoàn toàn tách biệt với luồng AI Serving (đọc baseline từ S3, query
+  Timestream cửa sổ 2h) — hai bên không đụng vào nhau.
+- **Consequence**: Kinesis đứng giữa làm bộ đệm nên spike 3× không làm mock service bị
+  nghẽn hay rớt request. Vì partition theo `service_id`, mỗi service tự động được route vào
+  shard riêng, throughput không lấn nhau (đúng yêu cầu chống noisy-neighbor ở mục 4.4) — và
+  còn có thêm 24h replay để debug, thứ mà SQS không có. Việc gộp transform + PII filter vào
+  cùng 1 Lambda cũng giúp đỡ một bước trung gian, không cần tách riêng component lọc PII.
+
+  Đổi lại, data sẽ không xuất hiện trong Timestream ngay tức thì — phải đi qua Kinesis rồi
+  buffer ở Firehose 60s rồi mới tới Lambda transform — nên cần để ý độ trễ này không ăn hết
+  ngân sách thời gian so với yêu cầu lead time ≥15 phút của AI Serving. Một rủi ro khác là
+  Timestream không hỗ trợ upsert, nên nếu Lambda Transformer phải retry (do lỗi tạm thời),
+  có thể ghi trùng cùng timestamp — đã ghi nhận ở ADR-002, cần có idempotency check để xử lý.
+  Kinesis On-Demand tự scale shard theo traffic nên không phải lo capacity planning thủ công,
+  nhưng vẫn có quota giới hạn của AWS cần theo dõi nếu traffic vượt xa mức thiết kế ban đầu
+  (xem thêm mục 3.3 weakness trong 02_infra_design.md).
 - **Alternatives considered**:
-  - **Write trực tiếp từ Ingest Service vào Timestream (không qua queue)**: rejected — không chịu được sudden spike 3× mà không drop metric hoặc tăng latency response cho client gửi telemetry
-  - **Kinesis Data Streams**: rejected — shard management phức tạp hơn SQS, và capstone không cần khả năng replay stream (đã loại ở ADR-001 khi so sánh cho ingest pipeline tổng thể)
+  - **Ghi thẳng từ mock service vào Timestream, không qua queue/stream nào**: bị loại vì
+    không chịu được spike 3× — sẽ rớt metric hoặc làm response chậm lại
+  - **Amazon SQS**: bị loại vì SQS không hỗ trợ partition theo `service_id`, nên không cách
+    ly được throughput giữa các service, và cũng không có khả năng replay. Kinesis On-Demand
+    vận hành đơn giản tương đương SQS mà lại có thêm 2 cái này, nên chọn Kinesis hợp lý hơn
+  - **Apache Kafka trên MSK**: bị loại vì phải tự quản lý cluster, chi phí cao hơn mức ngân
+    sách $200/1 tháng cho phép, không hợp với timeline ngắn của dự án này
 
 ---
 
