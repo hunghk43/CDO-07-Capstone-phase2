@@ -40,23 +40,25 @@ Nếu có SLO không đạt, nguyên nhân gốc rễ và biện pháp khắc ph
 * **Tool:** k6
 * **Load profile:** Ramp-up từ 0 → 100 RPS trong 5 phút, duy trì 100 RPS trong 10 phút
 * **Services simulated:** payment-gateway, kyc-service, reporting-api
-* **Workload:** Synthetic telemetry với gradual drift và sudden spike patterns
+* **Workload:** Synthetic telemetry với gradual drift và sudden spike patterns, gửi qua ADOT collector sidecar tới AI Engine trên ECS Fargate
 
 ### 3.2 Results
 
-| Metric                 | Target    | Achieved |
-| ---------------------- | --------- | -------- |
-| Sustained throughput   | 100 RPS   | X        |
-| AI Engine P99 latency  | < 500ms   | Xms      |
-| End-to-end P99 latency | < 1500ms  | Xms      |
-| Error rate             | < 1%      | X%       |
-| Auto-scale triggered   | ≥ 3 tasks | ✓/✗      |
+| Metric                  | Target    | Achieved |
+| ------------------------ | --------- | -------- |
+| Sustained throughput     | 100 RPS   | X        |
+| AI Engine P99 latency    | < 500ms   | Xms      |
+| End-to-end P99 latency   | < 1500ms  | Xms      |
+| Error rate               | < 1%      | X%       |
+| Auto-scale triggered     | ≥ 3 tasks | ✓/✗      |
+| ADOT ingestion lag (AMP) | < 30s     | Xs       |
 
 ### 3.3 Bottleneck identified
 
-* Compute bottleneck: ...
-* Database bottleneck: ...
-* Streaming bottleneck: ...
+* Compute bottleneck: ECS Fargate AI Engine task CPU/memory dưới sustained load — ...
+* ADOT sidecar bottleneck: collector export throughput tới AMP remote-write endpoint — ...
+* Database bottleneck: AMP ingestion rate / PromQL query latency dưới cardinality cao — ...
+* Networking bottleneck: ALB target group connection saturation hoặc VPC Endpoint throughput — ...
 
 > TODO W12: Ghi nhận thành phần giới hạn hiệu năng cao nhất.
 
@@ -103,16 +105,16 @@ Nếu có SLO không đạt, nguyên nhân gốc rễ và biện pháp khắc ph
 | `401` | Thiếu/sai auth — thiếu `X-Tenant-Id` hoặc SigV4 fail | Refresh credential, retry once |
 | `422` | Schema/type validation fail — thiếu field bắt buộc, sai kiểu, `signal_window` < 120 điểm | Fix client code, KHÔNG retry |
 | `429` | Rate-limited (> 600 req/phút/tenant) | Exponential backoff (1s → 2s → 4s ...) |
-| `503` | AI engine unavailable | Fallback to rule-based alert (CDO **bắt buộc** có fallback path) |
+| `503` | AI engine unavailable | Fail-open sang static thresholds (CDO **bắt buộc** có fallback path) |
 
 ## 6. Multi-tenant isolation test
 
-| Test                                 | Expected Result | Actual Result |
-| ------------------------------------ | --------------- | ------------- |
-| Service A truy cập dữ liệu Service B | 403 Forbidden   | ✓/✗           |
-| Cross-service metric injection       | Reject request  | ✓/✗           |
-| TSDB query không có tenant filter    | Empty/Error     | ✓/✗           |
-| Cross-service S3 access              | AccessDenied    | ✓/✗           |
+| Test                                  | Expected Result | Actual Result |
+| -------------------------------------- | --------------- | ------------- |
+| Service A truy cập dữ liệu Service B   | 403 Forbidden   | ✓/✗           |
+| Cross-service metric injection         | Reject request  | ✓/✗           |
+| AMP / PromQL query không có tenant filter | Empty/Error   | ✓/✗           |
+| Cross-service S3 access                | AccessDenied    | ✓/✗           |
 
 **Kết quả:** Không phát hiện data leakage giữa các tenants.
 
@@ -135,12 +137,12 @@ Nếu có SLO không đạt, nguyên nhân gốc rễ và biện pháp khắc ph
 
 Kết quả load test được đối chiếu với các giả định chi phí trong `05_cost_analysis.md`.
 
-| Assumption                            | Status |
-| ------------------------------------- | ------ |
-| Monthly cost < $200                   | ✓/✗    |
-| Kinesis throughput within estimate    | ✓/✗    |
-| Timestream query scan within estimate | ✓/✗    |
-| AWS Budget alert not triggered        | ✓/✗    |
+| Assumption                              | Status |
+| ----------------------------------------- | ------ |
+| Monthly cost < $180 (budget alert threshold) | ✓/✗    |
+| ADOT sidecar overhead within estimate ($35.56) | ✓/✗  |
+| AMP samples ingested/queried within estimate ($0.93) | ✓/✗ |
+| AWS Budget alert not triggered             | ✓/✗    |
 
 > TODO W12: Điền số liệu thực tế từ Cost Explorer và AWS Budgets.
 
