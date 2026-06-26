@@ -8,111 +8,117 @@
 
 ![CDO7 Architecture](images/CDO7.drawio.png)
 
-*Caption: Hệ thống Foresight Lens predictive monitoring với telemetry pipeline từ mock services qua Kinesis Streams đến Timestream DB, AI inference engine chạy trên ECS Fargate, và dashboard tích hợp Grafana annotations. Load balancer định tuyến các prediction requests, circuit breaker ngăn chặn vượt ngân sách.*
+*Caption: Hệ thống TF4 Foresight Lens - CDO Platform Architecture với k6 Load Generator, mock services trên ECS Fargate, AI Engine với ML models, Amazon Managed Prometheus cho time-series storage, EventBridge scheduling, SNS notifications, và Grafana dashboard. Architecture bao gồm complete observability stack với audit logs và cost control.*
 
 ## 2. Component table
 
 | Component | AWS Service | Reason | Cost note |
 |---|---|---|---|
-| **Compute** | ECS Fargate | AI inference engine cần uptime 24/7, loại bỏ Lambda cold start với ML libraries | $11.25 |
-| **API entry** | Application Load Balancer | Định tuyến `/v1/predict` requests, health checks, quản lý target group | $18.43 |
-| **Database** | Amazon Timestream | Tối ưu time-series, auto-tiered storage (7 ngày Memory + 90 ngày Magnetic), truy vấn SQL | $28.50 |
-| **Storage** | S3 Standard | ML model baselines theo service, configuration files, lifecycle policies | $1.65 |
-| **Event bus** | Kinesis Data Streams (Provisioned) | 3 shards phân vùng theo service_id, khả năng replay 24h, cách ly multi-tenant | $32.85 |
-| **Observability** | Amazon Managed Grafana | Tích hợp trực tiếp Timestream, annotations overlay, quản lý workspace | $9.00 |
-| **Load Generation** | ECS Fargate (3 tasks) | Mock payment/kyc/reporting services, mô phỏng Node.js async I/O | $22.83 |
-| **Stream Delivery** | Kinesis Data Firehose | Chuyển đổi format sang Timestream, cấu hình delivery buffer | $4.35 |
-| **Audit Storage** | S3 Standard + KMS | Prediction audit logs định dạng JSON, mã hóa at-rest, lifecycle sang IA sau 30 ngày | $0.50 |
-| **Functions** | Lambda + EventBridge | window-feeder (trigger 5 phút), pii-filter (per-event), cost circuit breaker | $0.85 |
-| **Networking** | VPC Endpoints | ECR, CloudWatch, Timestream, S3, Kinesis - kết nối private | $41.50 |
-| **Logging** | CloudWatch Logs | Centralized logging tất cả services, retention 7 ngày | $8.11 |
-| **Cost Control** | AWS Budgets | Ngưỡng cảnh báo $180, trigger Lambda circuit breaker | $0.10 |
-| **Total** | | | **$179.92** |
+| **Compute** | ECS Fargate | AI inference engine + 3 mock services, 900 vCPU-hour + 1,800 GB-hour | $44.43 |
+| **ADOT Sidecar Overhead** | ECS Fargate (additional) | ADOT collectors per task, 0.25 vCPU/0.5GB × 4 tasks × 720h | $35.56 |
+| **API entry** | Application Load Balancer | Định tuyến requests, health checks, 1 ALB + 1 LCU average | $21.96 |
+| **Database** | Amazon Managed Prometheus (AMP) | Time-series storage, 10M samples ingested + queried, PromQL queries | $0.93 |
+| **Storage** | S3 Standard + Glacier | ML baselines, audit logs, lifecycle policies, 10GB + 5GB archive | $0.79 |
+| **Event Orchestration** | EventBridge + Lambda | Scheduling every 5min, window feeder functions, circuit breaker | $0.03 |
+| **Observability** | Amazon Managed Grafana | Dashboard visualization, 1 active editor/admin user | $9.00 |
+| **Data Collection** | ADOT (AWS Distro for OpenTelemetry) | Sidecar collectors, metrics ingestion pipeline | Included above |
+| **Container Registry** | Amazon ECR | Container image storage cho ECS services, 5GB storage | $0.50 |
+| **Audit & Compliance** | S3 + CloudWatch Logs | Prediction audit logs, centralized logging, 5GB logs | $3.15 |
+| **Functions** | Lambda + SNS | Cost circuit breaker, alert notifications, Slack integration | $0.02 |
+| **Networking** | VPC Endpoints (4 endpoints) | ECR, CloudWatch, AMP, private service access, 720h × 4 | $28.80 |
+| **Cost Control** | AWS Budgets + Parameter Store | Budget thresholds, inference control flags | $0.00 |
+| **Total** | | | **$145.15** |
 
 ## 3. Differentiation angle deep-dive
 
 ### 3.1 Why this angle?
 
-**Serverless-first + Managed TSDB**: Chọn kiến trúc này để tối ưu cho ràng buộc capstone - zero ops overhead, chi phí dự đoán được, và timeline triển khai nhanh. Các pattern thay thế (self-managed clusters, traditional monitoring stack) yêu cầu đầu tư vận hành đáng kể không phù hợp với khung thời gian triển khai 3 tuần.
+**Event-Driven + ADOT/AMP**: Chọn kiến trúc này để tối ưu cho ràng buộc capstone - cost-effective managed services, zero ops overhead, và rapid development cycle. AWS Distro for OpenTelemetry (ADOT) cung cấp standardized metrics collection, Amazon Managed Prometheus cho time-series storage quen thuộc, và event-driven orchestration với EventBridge.
 
 Các quyết định kiến trúc chính:
-- Managed services thay vì self-hosted (Timestream vs Prometheus cluster)  
-- ECS Fargate always-on thay vì Lambda (loại bỏ vấn đề ML cold start)
-- Xử lý stream-native (Kinesis) thay vì batch ETL patterns
-- Single TSDB table thay vì per-service databases (đơn giản vận hành)
+- ADOT + AMP thay vì Kinesis + Timestream (60% cheaper, familiar Prometheus ecosystem)
+- EventBridge scheduling thay vì stream processing (simpler event-driven patterns)  
+- Sidecar ADOT collectors cho standardized observability
+- Managed Grafana với native AMP integration
 
 ### 3.2 Where we excel (numbers)
 
 | Axis | My number | Competing angle estimate |
 |---|---|---|
-| Chi phí/tháng | $179.92 (89.96% budget utilization) | $200+ (EC2 + EBS + ops tools) |
-| Thời gian triển khai | <4h (Terraform + container deploy) | 2-3 ngày (cluster setup + config) |
+| Chi phí/tháng | $145.15 (80.6% budget utilization) | $200+ (EC2 + EBS + ops tools) |
+| Thời gian triển khai | <3h (Terraform + ADOT + containers) | 2-3 ngày (cluster setup + config) |
 | Ops overhead (giờ/tuần) | 0 (fully managed services) | 8-12 (patching, monitoring, scaling) |
 | Thời gian scale | Auto (managed service scaling) | Manual (cluster resize + rebalancing) |
 
 ### 3.3 Weakness acknowledged
 
-- **Vendor lock-in**: Phụ thuộc nặng vào AWS managed services (Timestream, Kinesis, Fargate). Trade-off chấp nhận được cho timeline capstone vs tính portable production.
-- **Single region**: Không có redundancy cross-region để tối thiểu hóa chi phí data transfer. Recovery strategy được ghi nhận trong ADR nhưng chưa triển khai.
-- **Managed service limits**: Bị giới hạn bởi AWS service quotas (Kinesis shard limits, Timestream ingestion rates) vs khả năng scale self-managed.
+- **ADOT overhead**: Sidecar collectors require additional 0.25 vCPU/0.5GB per task (+$35.56), critical cho standardized telemetry collection.
+- **AMP cardinality limits**: High-cardinality labels (request_id, raw user_id) có thể tăng cost significantly.
+- **VPC endpoint dependency**: 20% total cost từ VPC endpoints, cần thiết cho private networking nhưng expensive.
 
 ## 4. Multi-tenant approach
 
 ### 4.1 Tenant model
 
-- **Tenant ID format**: `service_id` (payment-gateway, kyc-service, reporting-api)
+- **Tenant ID format**: `service_id` (payment-gateway, ledger-service, fraud-detection)
 - **Header**: `service_id`, `tenant_id`, `metric_type` mandatory trong Kinesis payload
 - **Subscription tiers**: All 3 services Tier-1 (per-service baseline models, 5-min prediction intervals)
 
 ### 4.2 Isolation pattern
 
-- **Data isolation**: Pool model - single Timestream table `service-metrics` với phân tách dimension-level qua WHERE filters
-- **Compute isolation**: Shared ECS Fargate AI Engine với request-level routing theo payload service_id
-- **Tại sao pattern này**: Cân bằng hiệu quả chi phí vs độ mạnh isolation. Single table → cấu hình Grafana đơn giản, shared compute → tiết kiệm $60-80/tháng vs per-tenant containers
+- **Data isolation**: Label-based model - Prometheus metrics với service_id labels, query filtering qua PromQL
+- **Compute isolation**: Shared ECS Fargate AI Engine với request-level routing theo service identifier  
+- **Tại sao pattern này**: Prometheus native multi-tenancy qua labels, cost-effective shared compute, familiar PromQL syntax cho team
 
 ### 4.3 Tenant onboarding flow
 
 ```
-1. Đăng ký service_id → k6 allowlist + cấu hình mock engine
+1. Đăng ký service_id → k6 test suite configuration + mock service deployment
 2. AI team train baseline từ dữ liệu lịch sử → upload s3://baselines/{service_id}/
-3. EventBridge scheduler setup cho service (5-phút prediction intervals) 
-4. Clone Grafana dashboard template → cấu hình service_id variable filter
-5. Smoke test: xác minh metrics flow + prediction calls → tenant sẵn sàng
-   Tổng: <30 phút end-to-end
+3. EventBridge rules setup cho service scheduling và notifications
+4. Grafana dashboard provisioning → service_id label filters và alerts
+5. Smoke test: xác minh metrics ingestion + prediction API + notifications
+   Tổng: <25 phút end-to-end
 ```
 
 ### 4.4 Noisy neighbor mitigation
 
-- **Per-tenant quota**: Kinesis partition key = `service_id` → định tuyến shard tự động, cách ly throughput
-- **Kinesis shard limits**: Mỗi shard 1MB/sec hoặc 1000 records/sec capacity per partition
-- **Resource reservation**: AI Engine có thể thêm per-service rate limits (future enhancement)
-- **Audit isolation**: S3 audit logs được phân vùng theo date path `s3://audit-logs/{year}/{month}/{day}/` với prediction_id filename
+- **Per-tenant quota**: Prometheus label cardinality limits, EventBridge rule throttling per service
+- **Resource reservation**: ECS task CPU/memory limits, ALB target group health checks
+- **Rate limiting**: API Gateway usage plans cho prediction endpoints, circuit breaker patterns
+- **Monitoring isolation**: Separate CloudWatch log groups, SNS topic subscriptions per service tier
 
 ## 5. Alternatives considered
 
 ### 5.1 Compute layer
 
-- **Option A**: Lambda + API Gateway - Ưu điểm: chi phí theo invoke, auto-scaling · Nhược điểm: cold start 5-10s với ML libraries, giới hạn 15 phút
-- **Option B**: EKS + Kubernetes - Ưu điểm: container orchestration, linh hoạt · Nhược điểm: overhead quản lý cluster, chi phí cao hơn
-- ✅ **Đã chọn**: ECS Fargate + ALB - Lý do: Loại bỏ vấn đề cold start performance, latency dự đoán được <500ms, không cần quản lý cluster
+- **Option A**: Lambda + API Gateway - Ưu điểm: cost per invoke, auto-scaling · Nhược điểm: cold start 5-10s với ML libraries, 15min execution limit không đáp ứng **test window ≥2h requirement**
+- **Option B**: EKS + Kubernetes - Ưu điểm: container orchestration, unlimited runtime · Nhược điểm: ops overhead, không phù hợp với **$200/tháng budget constraint**
+- ✅ **Đã chọn**: ECS Fargate - Lý do: **Long-running processes cho 2h+ test windows**, predictable latency <200ms cho **lead time ≥15min**, managed service phù hợp budget
 
 ### 5.2 Database
 
-- **Option A**: Self-managed Prometheus trên EC2 - Ưu điểm: PromQL quen thuộc, open source · Nhược điểm: ops overhead, ~$90/tháng chi phí EC2
-- **Option B**: InfluxDB Cloud - Ưu điểm: tối ưu time-series · Nhược điểm: vendor lock-in, chi phí data transfer
-- ✅ **Đã chọn**: Amazon Timestream - Lý do: Zero-ops managed service, auto-tiered storage (7d + 90d), truy vấn SQL, $28.50/tháng
+- **Option A**: Self-managed Prometheus trên EC2 - Ưu điểm: full control, PromQL familiar · Nhược điểm: ops overhead vi phạm **zero-ops requirement**, ~$35/tháng + maintenance time
+- **Option B**: Amazon Timestream - Ưu điểm: managed service, auto-scaling · Nhược điểm: **account availability blocker**, SQL learning curve cho team, projected cost $45-85/tháng
+- ✅ **Đã chọn**: Amazon Managed Prometheus - Lý do: **Native support cho ≥90 day retention**, PromQL queries tối ưu cho **multi-tenant ≥3 services**, cost-effective $0.93/tháng cho demo scale
 
-### 5.3 Event streaming
+### 5.3 Time-series data collection
 
-- **Option A**: SQS Standard - Ưu điểm: setup đơn giản, chi phí thấp · Nhược điểm: không partitioning, không replay capability
-- **Option B**: Apache Kafka trên MSK - Ưu điểm: high throughput, mature ecosystem · Nhược điểm: quản lý cluster, chi phí cao hơn
-- ✅ **Đã chọn**: Kinesis Data Streams (Provisioned) - Lý do: Service_id partitioning quan trọng cho multi-tenant isolation, replay 24h cho testing, chi phí dự đoán được
+- **Option A**: Kinesis Data Streams - Ưu điểm: high throughput, ordered processing · Nhược điểm: stream processing complexity, không cần thiết cho **synthetic workload + k6 load test** use case
+- **Option B**: Direct CloudWatch Metrics - Ưu điểm: native AWS integration · Nhược điểm: không đáp ứng **high-volume time-series requirement (50k events/sec peak)**
+- ✅ **Đã chọn**: ADOT + EventBridge - Lý do: **Standardized telemetry collection** theo OpenTelemetry spec, **event-driven scheduling** phù hợp với **manual baseline refresh weekly cadence**, cost-effective cho capstone scale
+
+### 5.4 Prediction scheduling
+
+- **Option A**: Cron jobs trên EC2 - Ưu điểm: flexible scheduling · Nhược điểm: infrastructure management overhead, không scale với **per-service baseline requirement**
+- **Option B**: Kinesis Analytics realtime - Ưu điểm: streaming analytics · Nhược điểm: overkill cho **manual approval gate**, complexity không cần thiết
+- ✅ **Đã chọn**: EventBridge + Lambda - Lý do: **Event-driven patterns** phù hợp **predict + recommend only** (không auto-remediation), **cost circuit breaker integration** cho $200 budget cap, flexible scheduling cho multiple test scenarios
 
 ## 6. Scaling strategy
 
 - **Vertical**: ECS auto-scaling CPU >70% trong 2 phút → khởi chạy task bổ sung
-- **Horizontal**: Kinosis Provisioned mode thêm/bớt shards theo traffic spikes (manual scaling)
-- **Triggers**: CloudWatch alarms - ECS CPU utilization, Kinesis incoming records, Lambda error rates
+- **Horizontal**: EventBridge rules scaling, SNS fanout patterns cho multiple consumers  
+- **Triggers**: CloudWatch alarms - ECS CPU utilization, Prometheus ingestion rate, EventBridge rule invocations
 
 ## 7. Failure modes + recovery
 
@@ -120,14 +126,14 @@ Các quyết định kiến trúc chính:
 |---|---|---|---|---|
 | AI Engine crash | ALB health check fail 3 lần | ECS auto-restart task mới | <30s | 0 |
 | AI timeout >5.0s | Request timeout exception | Fail-open sang static thresholds | <1s | 0 |
-| Timestream outage | Firehose delivery errors | Kinesis 24h buffer retention | Auto | 0 |
-| Budget vượt $180 | AWS Budgets alert | Lambda circuit breaker qua SSM | <5s | 0 |
-| VPC endpoint failure | Connection timeout | Multi-endpoint redundancy | <30s | 0 |
+| Prometheus ingestion lag | CloudWatch metrics delay | EventBridge retry với exponential backoff | <2min | <30s |
+| Budget vượt $180 | AWS Budgets alert | Lambda circuit breaker qua SNS + parameter store | <5s | 0 |
+| VPC endpoint failure | Connection timeout | Multi-endpoint redundancy + fallback routes | <30s | 0 |
 
 ## Related documents
 
 - [`01_requirements_analysis.md`](01_requirements_analysis.md) - Business requirements mapping tới technical components
 - [`03_security_design.md`](03_security_design.md) - Network Security + IAM + PII firewall expand on infra concerns  
 - [`04_deployment_design.md`](04_deployment_design.md) - IaC Terraform + CI/CD GitOps cho infra này
-- [`05_cost_analysis.md`](05_cost_analysis.md) - Per-service cost model $179.92/tháng breakdown chi tiết + optimization strategies
+- [`05_cost_analysis.md`](05_cost_analysis.md) - Per-service cost model $145.15/tháng breakdown chi tiết + ADOT sidecar overhead $35.56 + optimization strategies
 - [`08_adrs.md`](08_adrs.md) - Infra architecture decisions (ADR-001 to ADR-004)
