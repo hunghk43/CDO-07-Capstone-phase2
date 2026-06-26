@@ -97,12 +97,13 @@ Nếu có SLO không đạt, nguyên nhân gốc rễ và biện pháp khắc ph
 
 ### 5.3 API contract validation
 
-| Test case            | Expected code | Result |
-| -------------------- | ------------- | ------ |
-| Invalid payload      | 422           | ✓/✗    |
-| Unauthorized request | 401           | ✓/✗    |
-| Rate limit exceeded  | 429           | ✓/✗    |
-| Service unavailable  | 503           | ✓/✗    |
+| Code | Meaning | CDO action |
+|---|---|---|
+| `400` | Well-formed nhưng input không hợp lệ (tenant_id datapoint ≠ header, data gap > 1 phút) | Fix client data, KHÔNG retry |
+| `401` | Thiếu/sai auth — thiếu `X-Tenant-Id` hoặc SigV4 fail | Refresh credential, retry once |
+| `422` | Schema/type validation fail — thiếu field bắt buộc, sai kiểu, `signal_window` < 120 điểm | Fix client code, KHÔNG retry |
+| `429` | Rate-limited (> 600 req/phút/tenant) | Exponential backoff (1s → 2s → 4s ...) |
+| `503` | AI engine unavailable | Fallback to rule-based alert (CDO **bắt buộc** có fallback path) |
 
 ## 6. Multi-tenant isolation test
 
