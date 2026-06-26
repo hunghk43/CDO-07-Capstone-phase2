@@ -15,18 +15,19 @@
 | Component | AWS Service | Reason | Cost note |
 |---|---|---|---|
 | **Compute** | ECS Fargate | AI inference engine + 3 mock services, 900 vCPU-hour + 1,800 GB-hour | $44.43 |
+| **ADOT Sidecar Overhead** | ECS Fargate (additional) | ADOT collectors per task, 0.25 vCPU/0.5GB × 4 tasks × 720h | $35.56 |
 | **API entry** | Application Load Balancer | Định tuyến requests, health checks, 1 ALB + 1 LCU average | $21.96 |
 | **Database** | Amazon Managed Prometheus (AMP) | Time-series storage, 10M samples ingested + queried, PromQL queries | $0.93 |
 | **Storage** | S3 Standard + Glacier | ML baselines, audit logs, lifecycle policies, 10GB + 5GB archive | $0.79 |
 | **Event Orchestration** | EventBridge + Lambda | Scheduling every 5min, window feeder functions, circuit breaker | $0.03 |
 | **Observability** | Amazon Managed Grafana | Dashboard visualization, 1 active editor/admin user | $9.00 |
-| **Data Collection** | ADOT (AWS Distro for OpenTelemetry) | Sidecar collectors, metrics ingestion pipeline | Included in ECS |
+| **Data Collection** | ADOT (AWS Distro for OpenTelemetry) | Sidecar collectors, metrics ingestion pipeline | Included above |
 | **Container Registry** | Amazon ECR | Container image storage cho ECS services, 5GB storage | $0.50 |
 | **Audit & Compliance** | S3 + CloudWatch Logs | Prediction audit logs, centralized logging, 5GB logs | $3.15 |
 | **Functions** | Lambda + SNS | Cost circuit breaker, alert notifications, Slack integration | $0.02 |
 | **Networking** | VPC Endpoints (4 endpoints) | ECR, CloudWatch, AMP, private service access, 720h × 4 | $28.80 |
 | **Cost Control** | AWS Budgets + Parameter Store | Budget thresholds, inference control flags | $0.00 |
-| **Total** | | | **$109.59** |
+| **Total** | | | **$145.15** |
 
 ## 3. Differentiation angle deep-dive
 
@@ -44,16 +45,16 @@ Các quyết định kiến trúc chính:
 
 | Axis | My number | Competing angle estimate |
 |---|---|---|
-| Chi phí/tháng | $109.59 (60.9% budget utilization) | $200+ (EC2 + EBS + ops tools) |
+| Chi phí/tháng | $145.15 (80.6% budget utilization) | $200+ (EC2 + EBS + ops tools) |
 | Thời gian triển khai | <3h (Terraform + ADOT + containers) | 2-3 ngày (cluster setup + config) |
 | Ops overhead (giờ/tuần) | 0 (fully managed services) | 8-12 (patching, monitoring, scaling) |
 | Thời gian scale | Auto (managed service scaling) | Manual (cluster resize + rebalancing) |
 
 ### 3.3 Weakness acknowledged
 
-- **ADOT overhead**: Sidecar collectors có thể tăng ECS task requirements (+$35.56 nếu cần 0.25 vCPU/0.5GB per task).
+- **ADOT overhead**: Sidecar collectors require additional 0.25 vCPU/0.5GB per task (+$35.56), critical cho standardized telemetry collection.
 - **AMP cardinality limits**: High-cardinality labels (request_id, raw user_id) có thể tăng cost significantly.
-- **VPC endpoint dependency**: 25% total cost từ VPC endpoints, cần thiết cho private networking nhưng expensive.
+- **VPC endpoint dependency**: 20% total cost từ VPC endpoints, cần thiết cho private networking nhưng expensive.
 
 ## 4. Multi-tenant approach
 
@@ -134,5 +135,5 @@ Các quyết định kiến trúc chính:
 - [`01_requirements_analysis.md`](01_requirements_analysis.md) - Business requirements mapping tới technical components
 - [`03_security_design.md`](03_security_design.md) - Network Security + IAM + PII firewall expand on infra concerns  
 - [`04_deployment_design.md`](04_deployment_design.md) - IaC Terraform + CI/CD GitOps cho infra này
-- [`05_cost_analysis.md`](05_cost_analysis.md) - Per-service cost model $109.59/tháng breakdown chi tiết + ADOT overhead analysis + optimization strategies
+- [`05_cost_analysis.md`](05_cost_analysis.md) - Per-service cost model $145.15/tháng breakdown chi tiết + ADOT sidecar overhead $35.56 + optimization strategies
 - [`08_adrs.md`](08_adrs.md) - Infra architecture decisions (ADR-001 to ADR-004)
