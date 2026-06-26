@@ -1,55 +1,67 @@
-# Deployment & CI/CD Design - Task Force 4 · CDO-07 
+# Deployment & CI/CD Design - Task Force 4 · CDO-07
 
 <!-- Doc owner: CDO-07
-     Status: Draft W11 T4
+     Status: Updated W12 T4 - aligned with ADOT/AMP architecture
      Word target: 1200-2000 từ
-     Last updated: 2026-06-23 -->
+     Last updated: 2026-06-26 -->
 
-Tài liệu này mô tả cách cấp phát và phát hành platform TF4 Foresight Lens trên
-AWS. Kiến trúc runtime là source of truth: Kinesis Data Streams → ECS Fargate
-Ingestor → Timestream for InfluxDB → ECS Predictor/Orchestrator → AI Engine.
-CI/CD chỉ triển khai kiến trúc này, không thay đổi data flow.
+Tài liệu này mô tả cách cấp phát và phát hành platform TF4 Foresight Lens trên AWS bằng Terraform và GitHub Actions.
+
+Kiến trúc runtime là source of truth theo [`02_infra_design.md`](02_infra_design.md):
+
+```text
+k6 Load Generator
+  → Application Load Balancer
+  → ECS Fargate Mock Services + ADOT sidecars
+  → Amazon Managed Prometheus (AMP)
+  → EventBridge + Lambda Window Feeder
+  → ECS Fargate AI Engine
+  → S3 Audit/Baseline + SNS/Slack + Amazon Managed Grafana
+```
+
+CI/CD chỉ triển khai kiến trúc này, không thay đổi data flow. Kiến trúc hiện tại dùng ADOT + AMP cho telemetry/time-series, không dùng Kinesis Data Streams hoặc Amazon Timestream.
 
 ## 1. IaC strategy
 
 ### 1.1 Tool choice
 
 - **IaC tool**: Terraform HCL.
-- **Lý do chọn**: Terraform có AWS provider ổn định, hỗ trợ module hóa tốt cho
-  VPC ba tầng, Kinesis, Timestream for InfluxDB, S3 audit, ECS Fargate,
-  CodeDeploy và observability; `terraform plan` cho phép review trước khi đổi
-  shared AWS account.
-- **Terraform version**: `>= 1.10, < 2.0` để sử dụng S3 native state locking.
-- **State backend**: S3 bucket `tf4-cdo07-tf-state`, bật versioning, block
-  public access, mã hóa SSE-KMS và `use_lockfile = true`.
-- **Không dùng database lock riêng**: S3 native lockfile là cơ chế khóa duy
-  nhất. IAM role chạy Terraform cần quyền đọc/ghi state object và
-  đọc/ghi/xóa file `.tflock`.
+- **AWS region**: `us-east-1`.
+- **Terraform version**: `>= 1.10, < 2.0` để dùng S3 native state locking.
+- **State backend**: S3 bucket `tf4-cdo07-tf-state`, bật versioning, block public access, SSE-KMS và `use_lockfile = true`.
+- **Authentication**: GitHub Actions assume AWS role qua OIDC, không dùng static AWS access keys.
 
-State bucket và GitHub OIDC role được tạo một lần qua bootstrap có review.
+Terraform được chọn vì AWS provider hỗ trợ tốt ECS Fargate, ALB, AMP, ADOT-related IAM, EventBridge, Lambda, S3, CloudWatch, SNS, Managed Grafana và GitHub OIDC. `terraform plan` cũng tạo review gate rõ ràng trước khi thay đổi shared AWS account.
+
+Bootstrap Terraform tạo một lần:
+
+- S3 remote state bucket và KMS key.
+- GitHub OIDC provider.
+- `AWS_PLAN_ROLE_ARN` cho `terraform plan`.
+- `AWS_DEPLOY_ROLE_ARN` cho `terraform apply` và ECS deployment.
+- ECR repositories cho container images.
 
 ### 1.2 Module structure
 
+Target module structure:
+
 ```text
 infra/
-├── bootstrap/                    # State bucket, KMS key, GitHub OIDC roles
+├── bootstrap/                    # State bucket, KMS key, GitHub OIDC roles, ECR
 ├── modules/
-│   ├── networking/               # VPC, public/private subnets, SG, endpoints
-│   ├── data/                     # Timestream for InfluxDB, S3 audit
-│   ├── streaming/                # Kinesis Data Streams và failure destination
-│   ├── ecs/
-│   │   ├── ingestor/             # Fargate Ingestor
-│   │   ├── orchestrator/         # Scheduled Fargate task definition
-│   │   └── ai-engine/            # AI Engine, ALB, 2 target groups
-│   ├── deployment/               # ECR, CodeDeploy app/deployment group
-│   └── observability/            # CloudWatch, EventBridge, Managed Grafana
+│   ├── networking/               # VPC, public/private subnets, SG, VPC endpoints
+│   ├── ai_hosting/               # ALB + ECS Fargate AI Engine
+│   ├── telemetry/                # ADOT collector config, AMP remote-write IAM
+│   ├── observability/            # AMP, Managed Grafana, CloudWatch alarms
+│   ├── scheduling/               # EventBridge rules, Lambda Window Feeder/CB
+│   └── audit/                    # S3 baseline/audit buckets and lifecycle
 ├── environments/
-│   ├── sandbox/
 │   ├── staging/
-│   └── prod/                     # Design-only trong capstone
+│   └── prod/
 └── scripts/
-    ├── smoke-test.sh
-    └── register-service.sh
+    ├── deploy-ecs-rolling.sh
+    ├── deploy-codedeploy-bluegreen.sh
+    └── smoke-test.sh
 ```
 
 ### 1.3 State management và deployment waves
@@ -57,85 +69,77 @@ infra/
 Mỗi environment dùng state key riêng:
 
 ```text
-tf4-cdo07/sandbox/terraform.tfstate
 tf4-cdo07/staging/terraform.tfstate
 tf4-cdo07/prod/terraform.tfstate
 ```
 
-Terraform dependency graph triển khai theo thứ tự:
+Deployment order:
 
-1. Networking và security boundary.
-2. Timestream for InfluxDB và S3 audit.
-3. Kinesis Data Streams.
-4. ECS Fargate Ingestor.
-5. Predictor/Orchestrator task definition và EventBridge Scheduler target.
-6. AI Engine ECS service theo Deployment Contract.
-7. Managed Grafana, CloudWatch alarms và EventBridge schedule.
+1. Networking, security groups và VPC endpoints.
+2. S3 baseline/audit, KMS và IAM boundaries.
+3. AMP workspace, ADOT collector config và CloudWatch log groups.
+4. ECS Fargate cluster, mock services và AI Engine service.
+5. ALB listener/target group và health checks.
+6. EventBridge + Lambda Window Feeder / Cost Circuit Breaker.
+7. Managed Grafana, SNS/Slack notification và CloudWatch alarms.
 
 ## 2. CI/CD pipeline
 
-### 2.1 Container workflow
+### 2.1 Pull request CI
 
 ```text
-PR opened
-  → Build changed container images
-  → Unit/Integration Test
-  → Gitleaks + Trivy
-  → Terraform fmt/validate/plan
-  → Review + approval
-  → Merge
-  → Push immutable images to ECR
-  → Terraform apply approved infrastructure changes
-  → Register ECS task-definition revision
-  → Deploy ECS service
-  → Smoke test
+PR opened/updated
+  → build-test.yml
+  → security-scan.yml
+  → terraform-plan.yml
+  → review + approval
+  → merge
 ```
 
-Image được tag bằng full Git SHA; không deploy tag mutable như `latest`.
+`build-test.yml` detect service source và chạy test theo ngôn ngữ:
 
-`deploy.yml` chỉ chạy qua `workflow_run` sau khi `build-test.yml` thành công,
-hoặc được gọi như reusable workflow với image digest truyền trực tiếp. Vì vậy
-deploy không thể chạy trước khi artifact tồn tại trong ECR.
+- Node.js: install dependencies, chạy `npm test --if-present`.
+- Python: install requirements/pyproject, chạy `pytest` nếu có `tests/`.
+- Go: chạy `go test ./...`.
+- Docker: build image nếu service có `Dockerfile`.
 
-### 2.2 Bốn GitHub Actions workflows
+Image được tag bằng full Git SHA. Không deploy mutable tag như `latest`.
 
-| Workflow | Trigger | Trách nhiệm | Quality gate |
+### 2.2 GitHub Actions workflows
+
+Repo hiện dùng các workflow sau:
+
+| Workflow | Trigger | Trách nhiệm | Gate |
 |---|---|---|---|
-| `build-test.yml` | PR; push `develop`, `main` | Build Ingestor và Orchestrator image; chạy unit/integration test; trusted push mới được push ECR | Build thành công, test pass |
-| `security-scan.yml` | Mọi PR | Gitleaks scan Git history; Trivy scan filesystem và image | Không có secret; 0 CRITICAL CVE |
-| `terraform-plan.yml` | PR thay đổi `infra/**` | `fmt -check`, `init`, `validate`, `tflint`, Checkov và `plan`; đăng plan summary vào PR | Plan được Tech Lead review |
-| `deploy.yml` | `workflow_run` sau build thành công; manual/approved `main` | Nhận image digest, apply infra change, đăng ký task revision, deploy đúng strategy, chạy smoke test | Artifact tồn tại, deployment success, smoke test pass |
+| `build-test.yml` | PR; push `develop`, `main` | Test service source và build Docker image nếu có | Build/test pass |
+| `security-scan.yml` | PR; push `develop`, `main` | Gitleaks, Trivy filesystem scan, Checkov Terraform scan | Không có secret; không có HIGH/CRITICAL issue chưa xử lý; Checkov pass |
+| `terraform-plan.yml` | PR vào `develop`/`main`; manual dispatch | `fmt`, `init`, `validate`, `plan`, ghi summary | Plan review trước merge |
+| `deploy-staging.yml` | Push vào `develop`; manual dispatch | Assume deploy role, login ECR, build/push image, `terraform apply` staging, deploy ECS, smoke test | Deploy success + smoke test |
+| `deploy-prod.yml` | Manual dispatch | Deploy full Git SHA đã pass staging, yêu cầu confirm `DEPLOY_PROD` và Environment approval | Đúng immutable digest + prod approval |
+| `drift-detection.yml` | Cron hằng ngày; manual dispatch | `terraform plan -detailed-exitcode` cho staging/prod/bootstrap | Exit 0 no drift; exit 2 warning; exit 1 fail |
+| `slack-notifications.yml` | Push, PR opened/reopened/ready, PR merged | Gửi Slack notification qua `SLACK_WEBHOOK_URL` | Webhook gửi thành công |
 
-Build matrix chỉ build service có source thay đổi. AI Engine image do nhóm AI
-sở hữu; CDO consume ECR URI/digest trong Deployment Contract.
+Không dùng workflow chung tên `deploy.yml` và không dùng `workflow_run` làm production gate. Production chỉ chạy manual để tránh deploy nhầm.
 
 ### 2.3 Branch strategy
 
-- `feature/<jira-id>-<description>`: nhánh làm việc.
-- PR `feature/*` → `develop`: CI pass và ít nhất một approval.
-- `develop`: source of truth của staging; merge thành công sẽ deploy staging.
-- PR `develop` → `main`: cần Tech Lead và GitHub Environment approval.
-- `main`: production-ready configuration; production design-only trong
-  capstone, demo có thể manual-dispatch artifact đã pass staging.
+- `feat/<scope>`: nhánh feature/docs/infra.
+- PR `feat/*` → `develop`: CI pass và ít nhất một approval.
+- `develop`: source of truth cho staging, merge vào đây trigger staging deployment.
+- PR `develop` → `main`: promotion sang production-ready baseline.
+- `main`: default branch; production/demo deploy bằng manual dispatch từ Git SHA đã pass staging.
 
-## 3. GitOps
+## 3. GitOps model
 
-CDO-07 dùng **GitHub Actions + Terraform + CodeDeploy** làm lightweight GitOps.
-Không bổ sung Kubernetes GitOps controller vì platform chạy ECS Fargate.
+CDO-07 dùng **GitHub Actions + Terraform + ECS Fargate** làm lightweight GitOps. Không dùng Kubernetes GitOps controller vì platform chạy trên ECS Fargate.
 
-Git lưu Terraform, task-definition/AppSpec template, service registry,
-CloudWatch alarms và GitHub Actions workflows.
+Ranh giới ownership:
 
-Application release và infrastructure release có ranh giới rõ:
+- Terraform sở hữu networking, IAM, AMP, S3, EventBridge/Lambda, CloudWatch, Grafana, ECS service baseline và ALB.
+- Release workflow sở hữu image SHA, task definition revision và ECS service rollout.
+- Không dùng image tag mutable trong Terraform release path.
 
-- Terraform sở hữu hạ tầng ổn định, ECS service ban đầu, ALB, target groups,
-  IAM, alarms và CodeDeploy deployment group.
-- Release workflow sở hữu image SHA, task-definition revision và application
-  deployment.
-- Không thay image tag trong Terraform sau mỗi release để tránh Terraform và
-  CodeDeploy cùng quản lý deployment state.
-
-Với ECS service được release ngoài Terraform, resource cấu hình:
+Với ECS services được release ngoài Terraform, Terraform resource nên ignore task definition drift do deployment workflow tạo:
 
 ```hcl
 lifecycle {
@@ -143,110 +147,68 @@ lifecycle {
 }
 ```
 
-Terraform vẫn quản lý desired count, network, load balancer và deployment
-policy. Deploy workflow quản lý task revision và Scheduler target, đồng thời
-lưu revision trước để rollback.
-
 ### 3.1 Drift detection
 
-Workflow theo lịch chạy hằng ngày:
+`drift-detection.yml` chạy hằng ngày:
 
 ```text
 terraform plan -detailed-exitcode
 0 → không có drift
-1 → plan lỗi, gửi alert
-2 → có drift hoặc configuration chưa apply, gửi Slack alert
+1 → plan lỗi
+2 → có drift hoặc infra chưa apply
 ```
 
-Slack nhận environment, workflow URL và plan summary; drift không được
-auto-apply.
+Workflow hiện ghi kết quả vào GitHub Actions summary. Drift không được auto-apply; mọi reconcile phải đi qua PR hoặc change request rõ ràng. Slack alert cho drift là bước mở rộng sau khi nối SNS/Slack vào workflow này.
 
 ## 4. Deployment strategy
 
-### 4.1 AI Engine: CodeDeploy Blue/Green
+### 4.1 AI Engine
 
-AI Engine là HTTP service đứng sau Application Load Balancer nên dùng
-CodeDeploy Blue/Green với:
-
-- Một production listener.
-- Hai target group Blue và Green.
-- ECS deployment controller `CODE_DEPLOY`.
-- Deployment config `CodeDeployDefault.ECSCanary10Percent5Minutes`.
-
-Traffic flow:
-
-1. CodeDeploy tạo Green task set từ task-definition revision mới.
-2. Pre-traffic smoke test gọi `/health` và một prediction fixture.
-3. Chuyển 10% traffic sang Green.
-4. Theo dõi CloudWatch alarms trong năm phút.
-5. Nếu tất cả gate đạt, chuyển 90% traffic còn lại sang Green.
-6. Giữ Blue trong bake period trước khi terminate.
-
-Không dùng custom traffic shift ba giai đoạn vì CodeDeploy không có predefined
-ECS configuration tương ứng.
-
-### 4.2 Ingestor: ECS rolling deployment
-
-Ingestor là long-running ECS service đọc Kinesis và không nhận user traffic qua
-ALB, nên dùng ECS rolling update:
+AI Engine là HTTP service chạy trên ECS Fargate sau Application Load Balancer. Deployment mặc định dùng ECS rolling update:
 
 - `minimumHealthyPercent = 100`.
 - `maximumPercent = 200`.
-- Bật ECS deployment circuit breaker và rollback.
-- Gắn CloudWatch deployment alarms.
+- ECS deployment circuit breaker enabled.
+- ALB health check gọi `/health`.
+- CloudWatch alarms theo dõi ALB 5xx, target health, p99 latency và task health.
 
-Health gate của Ingestor gồm task health, Kinesis iterator age và InfluxDB
-write error.
+Nếu production/demo cần canary hoặc blue/green, có thể dùng CodeDeploy với hai target groups. Đây là deployment enhancement, không phải data-flow requirement.
 
-### 4.3 Predictor/Orchestrator: scheduled Fargate task
+### 4.2 Mock Services + ADOT sidecars
 
-Predictor/Orchestrator là scheduled task, không phải service thường trực.
-EventBridge Scheduler dùng ECS `RunTask` mỗi năm phút. Task chạy một prediction
-cycle rồi thoát:
+Mock services sinh synthetic workload cho 3 tenants (`payment-gateway`, `ledger-service`, `fraud-detection`). Mỗi ECS task chạy ADOT sidecar để collect metrics và remote-write vào Amazon Managed Prometheus.
 
-1. Đọc metric window từ Timestream for InfluxDB.
+Deployment dùng ECS rolling update. Health gate:
+
+- ECS task đạt steady state.
+- ADOT collector không có remote-write error.
+- AMP ingestion/query health ổn định.
+- CloudWatch logs không có error spike.
+
+### 4.3 EventBridge + Lambda Window Feeder
+
+EventBridge chạy chu kỳ 5 phút để kích hoạt Lambda Window Feeder.
+
+Window Feeder flow:
+
+1. Query metric window từ AMP bằng PromQL.
 2. Gọi AI Engine `/v1/predict`.
-3. Ghi prediction vào InfluxDB và audit object vào S3.
-4. Nếu AI trả `503` hoặc timeout ba lần liên tiếp, mở circuit breaker và chạy
-   static-threshold fallback.
+3. Ghi prediction audit vào S3.
+4. Gửi notification qua SNS/Slack nếu phát hiện drift/capacity risk.
+5. Nếu AI timeout hoặc trả lỗi nhiều lần, kích hoạt fail-open static thresholds.
 
-Release workflow đăng ký revision, chạy `RunTask` smoke test rồi cập nhật
-Scheduler target. Rollback trỏ target về revision trước. Scheduler có retry
-policy và DLQ.
-
-### 4.4 Abort criteria và rollback
-
-AI Engine rollback nếu:
-
-- Error rate vượt 1%.
-- P99 latency vượt 500 ms.
-- Pre/post-traffic test thất bại.
-
-CodeDeploy tự redeploy last-known-good revision và chuyển traffic về Blue.
-Mục tiêu chuyển traffic về Blue là dưới 60 giây và phải được benchmark trong
-staging; mục tiêu toàn ECS service ổn định trở lại là dưới năm phút.
-
-Nếu Ingestor không đạt steady state hay alarm chuyển `ALARM`, ECS deployment
-circuit breaker rollback về task revision hoàn thành gần nhất. Orchestrator
-rollback bằng cách đưa Scheduler target về task revision trước. Infrastructure
-rollback dùng PR revert và `terraform apply`; không rollback state file thủ
-công.
+Rollback Window Feeder bằng PR revert hoặc Lambda version/alias rollback. Không rollback state file thủ công.
 
 ## 5. Environment separation
 
-Mỗi environment có ECS cluster, state key, prefix và tag riêng trong shared
-AWS account.
-
 | Environment | Branch/trigger | Mục đích | Deployment |
 |---|---|---|---|
-| Sandbox | Manual hoặc feature validation | Thử nghiệm nhanh và kiểm tra Terraform | Apply có manual gate |
-| Staging | Merge vào `develop` | Integration AI–CDO, load test, curveball | Tự deploy sau CI pass |
-| Production | Merge `develop` → `main` | Production-ready design | Design-only; manual approval nếu demo |
+| Staging | Merge/push vào `develop` | Integration AI-CDO, load test, curveball | Auto deploy sau CI pass |
+| Production/demo | Manual dispatch từ Git SHA đã pass staging | Demo production-ready baseline | GitHub Environment approval + confirm string |
 
-Sandbox có thể scale desired count về 0 ngoài giờ để tiết kiệm; naming, state
-và IAM isolation vẫn giữ nguyên.
+Mỗi environment có state key, prefix, tag và ECS cluster riêng trong cùng AWS account.
 
-## 6. Secrets in pipeline
+## 6. Secrets and variables
 
 GitHub Actions xác thực AWS bằng OIDC:
 
@@ -256,77 +218,75 @@ permissions:
   contents: read
 ```
 
-Workflow dùng `aws-actions/configure-aws-credentials` để lấy STS credential
-ngắn hạn; không lưu static AWS key trong GitHub Secrets.
+Repository variables:
 
-Tách IAM role theo nhiệm vụ:
+| Variable | Mục đích |
+|---|---|
+| `AWS_ACCOUNT_ID` | AWS account triển khai |
+| `AWS_PLAN_ROLE_ARN` | Role cho Terraform plan |
+| `AWS_DEPLOY_ROLE_ARN` | Role cho Terraform apply/ECS deploy |
+| `STAGING_BASE_URL` | Base URL cho smoke test staging |
+| `PROD_BASE_URL` | Base URL cho smoke test prod/demo |
 
-- **CI role**: push đúng ECR repository, đọc metadata cần thiết.
-- **Plan role**: đọc resource và truy cập state/lock object; không deploy.
-- **Deploy role**: apply environment, đăng ký task definition, cập nhật ECS và
-  khởi tạo CodeDeploy.
+Repository secrets:
 
-Application secret nằm trong Secrets Manager; pipeline chỉ truyền ARN.
-Gitleaks chạy trên PR và log phải redact credential.
+| Secret | Mục đích |
+|---|---|
+| `SLACK_WEBHOOK_URL` | Slack incoming webhook cho push/PR/merge notification |
+
+Không lưu AWS static access key trong GitHub Secrets. Application secrets nằm trong AWS Secrets Manager hoặc SSM Parameter Store; pipeline chỉ truyền ARN hoặc parameter name.
 
 ## 7. Service onboarding deployment
 
-Onboarding là đăng ký service vào telemetry và baseline pipeline:
+Onboarding service mới vào telemetry/baseline pipeline:
 
-1. Thêm `tenant_id`, `service_id`, metric whitelist, unit và retention policy
-   vào service registry có version control.
-2. Pull request được review và merge.
-3. Deploy cấu hình mới cho Ingestor; cấp producer quyền tối thiểu để ghi đúng
-   Kinesis stream.
-4. Producer gửi metric có schema bắt buộc vào Kinesis.
-5. Fargate Ingestor validate, batch và ghi metric bằng Influx Line Protocol
-   vào Timestream for InfluxDB.
-6. Smoke test query metric và xác minh hiển thị trên Managed Grafana.
-7. Nhóm AI manual-trigger baseline training khi đã có đủ dữ liệu.
+1. Đăng ký `service_id`, tenant label, metric whitelist và alert policy.
+2. Cập nhật ADOT collector config hoặc service instrumentation.
+3. Deploy service/mock service qua ECS Fargate.
+4. ADOT sidecar remote-write metrics vào AMP.
+5. Smoke test PromQL query theo `service_id`.
+6. Provision Grafana dashboard filter/annotation cho service.
+7. AI team trigger baseline training khi đủ dữ liệu lịch sử.
 
-Record sai schema được log và chuyển đến failure destination đã khóa trong
-Telemetry Contract.
+Metric sai schema hoặc label cardinality vượt chuẩn được log/drop theo ADOT collector policy và cảnh báo qua CloudWatch/SNS.
 
-## 8. Observability stack
+## 8. Observability and smoke test
 
-| Thành phần | Công cụ | Metric/evidence |
+| Thành phần | Công cụ | Evidence |
 |---|---|---|
-| Time-series source | Amazon Timestream for InfluxDB, Single-AZ cho POC | Metrics và predictions; bucket retention 90 ngày |
-| Dashboard | Amazon Managed Grafana | Metrics, prediction, recommendation và annotation |
+| Time-series source | Amazon Managed Prometheus | Samples ingested, PromQL query result, cardinality |
+| Collection | ADOT sidecar | Remote-write success/error, collector logs |
+| Dashboard | Amazon Managed Grafana | Metrics, prediction, recommendation, annotation |
 | ECS logs | CloudWatch Logs | Structured JSON, correlation ID, retention 14 ngày |
-| Ingest monitoring | CloudWatch | Kinesis throughput/throttling, `GetRecords.IteratorAgeMilliseconds`, InfluxDB write errors |
-| Serving monitoring | CloudWatch | ALB 5xx, error rate, p50/p99 latency, task health, circuit-breaker state |
-| Audit | S3 SSE-KMS | Prediction audit, retention 90 ngày |
-| Scheduling | EventBridge Scheduler → ECS `RunTask` | Khởi chạy Predictor/Orchestrator mỗi năm phút |
-| Notification | SNS/Slack | Deploy, rollback, alarm và Terraform drift |
+| Serving monitoring | CloudWatch + ALB | ALB 5xx, p50/p99 latency, task health |
+| Audit | S3 SSE-KMS | Prediction audit, baseline artifacts |
+| Scheduling | EventBridge + Lambda | Window feeder invocation, retry, DLQ |
+| Notification | SNS/Slack | Deploy, rollback, alarm, PR/merge notification |
 
 Smoke test sau deployment cần chứng minh:
 
-1. Ingest một telemetry fixture vào Kinesis.
-2. Metric query được trong Timestream for InfluxDB.
-3. Orchestrator gọi được AI endpoint.
-4. Prediction được ghi vào Timestream.
-5. Audit object xuất hiện trong S3.
+1. Mock service phát sinh telemetry fixture.
+2. ADOT sidecar remote-write metric vào AMP.
+3. PromQL query trả được metric theo `service_id`.
+4. Lambda Window Feeder gọi được AI Engine `/v1/predict`.
+5. Prediction audit object xuất hiện trong S3.
 6. AI `503` hoặc timeout kích hoạt static-threshold fallback.
 
 ## 9. Open questions
 
-- [ ] AI Deployment Contract đã khóa ECR ownership, container port, `/health`,
-  CPU/memory và task role chưa?
-- [ ] Telemetry Contract chọn failure destination nào cho record sai schema?
-- [ ] Shared AWS account có cho phép tạo GitHub OIDC provider và các
-  least-privilege deployment role không?
-- [ ] Ai sở hữu Slack webhook/SNS topic cho deployment và drift notification?
-- [ ] Repository admin đã bật branch protection và GitHub Environment approval
-  cho `develop`/`main` chưa?
+- [ ] AI Deployment Contract đã khóa ECR ownership, container port, `/health`, CPU/memory và task role chưa?
+- [ ] ADOT collector config, Prometheus labels và cardinality limit đã được khóa trong Telemetry Contract chưa?
+- [ ] `STAGING_BASE_URL` và `PROD_BASE_URL` đã được cấu hình để smoke test không skip chưa?
+- [ ] Drift detection có cần gửi Slack alert ngay trong W12 hay chỉ giữ GitHub Actions summary?
+- [ ] Runtime Terraform roots `staging` và `prod` đã đủ module networking, ai_hosting, telemetry, scheduling, audit và observability chưa?
 
 ## Related documents
 
 - [`02_infra_design.md`](02_infra_design.md) - Runtime architecture và component ownership.
 - [`03_security_design.md`](03_security_design.md) - IAM, network, encryption và audit controls.
-- [`08_adrs.md`](08_adrs.md) - Quyết định Terraform, ECS và deployment strategy.
-- [AWS ECS CodeDeploy Blue/Green](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-type-bluegreen.html)
-- [EventBridge Scheduler ECS target](https://docs.aws.amazon.com/scheduler/latest/APIReference/API_Target.html)
-- [Timestream for InfluxDB](https://docs.aws.amazon.com/timestream/latest/developerguide/timestream-for-influxdb.html)
+- [`05_cost_analysis.md`](05_cost_analysis.md) - Cost model ADOT/AMP.
+- [`08_adrs.md`](08_adrs.md) - Architecture decision records.
+- [Amazon Managed Service for Prometheus](https://docs.aws.amazon.com/prometheus/latest/userguide/what-is-Amazon-Managed-Service-Prometheus.html)
+- [AWS Distro for OpenTelemetry](https://aws-otel.github.io/)
 - [Terraform S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3)
 - [GitHub Actions OIDC với AWS](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws)
