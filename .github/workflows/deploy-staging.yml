@@ -1,0 +1,180 @@
+name: deploy-staging
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-1
+  ENVIRONMENT: staging
+  PROJECT_DIR: xbrain-learners/capstone/tf-4/cdo-07
+  SERVICES: ingest-service ingest-worker ai-serving
+
+jobs:
+  deploy:
+    name: Deploy staging
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Validate deployment prerequisites
+        id: preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform_root="${PROJECT_DIR}/infra/environments/${ENVIRONMENT}"
+          if [[ ! -d "$terraform_root" ]] || ! find "$terraform_root" -maxdepth 1 -type f -name '*.tf' | grep -q .; then
+            echo "deploy_ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Staging deploy skipped::${terraform_root} does not exist yet. Add Terraform runtime infrastructure to enable deployment."
+            {
+              echo "## Staging deploy skipped"
+              echo ""
+              echo "Missing Terraform root: \`${terraform_root}\`"
+              echo ""
+              echo "This is expected until the runtime ECS/Terraform environment is added."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "deploy_ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push service images
+        if: steps.preflight.outputs.deploy_ready == 'true'
+        id: images
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          manifest="${RUNNER_TEMP}/image-manifest.json"
+          echo '{}' > "$manifest"
+
+          for service in ${SERVICES}; do
+            service_dir="${PROJECT_DIR}/services/${service}"
+            repository="tf4-cdo07-${service}"
+            image_uri="${ECR_REGISTRY}/${repository}:${GITHUB_SHA}"
+
+            if [[ ! -f "${service_dir}/Dockerfile" ]]; then
+              echo "::notice title=Image build skipped::${service_dir}/Dockerfile does not exist yet."
+              continue
+            fi
+
+            docker build --tag "$image_uri" "$service_dir"
+            docker push "$image_uri"
+
+            digest="$(aws ecr describe-images \
+              --repository-name "$repository" \
+              --image-ids "imageTag=${GITHUB_SHA}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text)"
+
+            jq --arg service "$service" \
+              --arg image "${ECR_REGISTRY}/${repository}@${digest}" \
+              '. + {($service): $image}' "$manifest" > "${manifest}.tmp"
+            mv "${manifest}.tmp" "$manifest"
+          done
+
+          echo "manifest_path=${manifest}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Staging image digest manifest"
+            echo ""
+            echo '```json'
+            jq . "$manifest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload staging image manifest
+        if: steps.preflight.outputs.deploy_ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-image-manifest-${{ github.sha }}
+          path: ${{ steps.images.outputs.manifest_path }}
+          if-no-files-found: error
+
+      - name: Terraform apply staging
+        if: steps.preflight.outputs.deploy_ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform_root="${PROJECT_DIR}/infra/environments/${ENVIRONMENT}"
+          terraform -chdir="$terraform_root" init -input=false
+          terraform -chdir="$terraform_root" apply -input=false -auto-approve
+
+      - name: Deploy ingest-service rolling update
+        if: steps.preflight.outputs.deploy_ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(jq -r '."ingest-service" // empty' '${{ steps.images.outputs.manifest_path }}')"
+          if [[ -z "$image" ]]; then
+            echo "::notice title=ingest-service image missing::No image digest was produced; skipping service deployment."
+            exit 0
+          fi
+          "${PROJECT_DIR}/scripts/deploy-ecs-rolling.sh" \
+            "${ENVIRONMENT}" \
+            "ingest-service" \
+            "$image"
+
+      - name: Deploy ingest-worker rolling update
+        if: steps.preflight.outputs.deploy_ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(jq -r '."ingest-worker" // empty' '${{ steps.images.outputs.manifest_path }}')"
+          if [[ -z "$image" ]]; then
+            echo "::notice title=ingest-worker image missing::No image digest was produced; skipping service deployment."
+            exit 0
+          fi
+          "${PROJECT_DIR}/scripts/deploy-ecs-rolling.sh" \
+            "${ENVIRONMENT}" \
+            "ingest-worker" \
+            "$image"
+
+      - name: Deploy ai-serving blue/green
+        if: steps.preflight.outputs.deploy_ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(jq -r '."ai-serving" // empty' '${{ steps.images.outputs.manifest_path }}')"
+          if [[ -z "$image" ]]; then
+            echo "::notice title=ai-serving image missing::No image digest was produced; skipping service deployment."
+            exit 0
+          fi
+          "${PROJECT_DIR}/scripts/deploy-codedeploy-bluegreen.sh" \
+            "${ENVIRONMENT}" \
+            "ai-serving" \
+            "$image"
+
+      - name: Smoke test staging
+        if: steps.preflight.outputs.deploy_ready == 'true'
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.STAGING_BASE_URL }}
+        run: "${PROJECT_DIR}/scripts/smoke-test.sh"

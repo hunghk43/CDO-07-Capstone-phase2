@@ -1,0 +1,179 @@
+name: deploy-prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_sha:
+        description: Full Git SHA/image tag that has passed staging
+        required: true
+        type: string
+      confirm:
+        description: Type DEPLOY_PROD to confirm production deployment
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-1
+  ENVIRONMENT: prod
+  PROJECT_DIR: xbrain-learners/capstone/tf-4/cdo-07
+  SERVICES: ingest-service ingest-worker ai-serving
+
+jobs:
+  deploy:
+    name: Deploy production
+    runs-on: ubuntu-latest
+    environment: prod
+
+    steps:
+      - name: Validate manual confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirm }}" != "DEPLOY_PROD" ]]; then
+            echo "::error title=Invalid confirmation::Type DEPLOY_PROD to deploy production."
+            exit 1
+          fi
+
+          if [[ ! "${{ inputs.git_sha }}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Invalid Git SHA::Use the full 40-character Git SHA that passed staging."
+            exit 1
+          fi
+
+      - name: Verify staging deployment passed for Git SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ inputs.git_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          found="$(
+            gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow deploy-staging.yml \
+              --branch develop \
+              --status success \
+              --json headSha,databaseId,url \
+              --limit 100 \
+            | jq -r --arg sha "$TARGET_SHA" '.[] | select(.headSha == $sha) | [.databaseId, .url] | @tsv' \
+            | head -n 1
+          )"
+
+          if [[ -z "$found" ]]; then
+            echo "::error title=Staging gate failed::No successful deploy-staging run was found for ${TARGET_SHA}."
+            exit 1
+          fi
+
+          echo "Matched staging deployment: $found"
+
+      - name: Checkout exact Git SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Resolve immutable image digests from approved SHA
+        id: images
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TARGET_SHA: ${{ inputs.git_sha }}
+        run: |
+          set -euo pipefail
+          manifest="${RUNNER_TEMP}/prod-image-manifest.json"
+          echo '{}' > "$manifest"
+
+          for service in ${SERVICES}; do
+            repository="tf4-cdo07-${service}"
+            digest="$(aws ecr describe-images \
+              --repository-name "$repository" \
+              --image-ids "imageTag=${TARGET_SHA}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text)"
+
+            if [[ -z "$digest" || "$digest" == "None" ]]; then
+              echo "::error title=Image digest missing::${repository}:${TARGET_SHA} does not exist in ECR."
+              exit 1
+            fi
+
+            jq --arg service "$service" \
+              --arg image "${ECR_REGISTRY}/${repository}@${digest}" \
+              '. + {($service): $image}' "$manifest" > "${manifest}.tmp"
+            mv "${manifest}.tmp" "$manifest"
+          done
+
+          echo "manifest_path=${manifest}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Production image digest manifest"
+            echo ""
+            echo '```json'
+            jq . "$manifest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply production
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform_root="${PROJECT_DIR}/infra/environments/${ENVIRONMENT}"
+          if [[ ! -d "$terraform_root" ]] || ! find "$terraform_root" -maxdepth 1 -type f -name '*.tf' | grep -q .; then
+            echo "::error title=Missing Terraform environment::${terraform_root} must exist before production deploy can run."
+            exit 1
+          fi
+          terraform -chdir="$terraform_root" init -input=false
+          terraform -chdir="$terraform_root" apply -input=false -auto-approve
+
+      - name: Deploy ingest-service rolling update
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${PROJECT_DIR}/scripts/deploy-ecs-rolling.sh" \
+            "${ENVIRONMENT}" \
+            "ingest-service" \
+            "$(jq -r '."ingest-service"' '${{ steps.images.outputs.manifest_path }}')"
+
+      - name: Deploy ingest-worker rolling update
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${PROJECT_DIR}/scripts/deploy-ecs-rolling.sh" \
+            "${ENVIRONMENT}" \
+            "ingest-worker" \
+            "$(jq -r '."ingest-worker"' '${{ steps.images.outputs.manifest_path }}')"
+
+      - name: Deploy ai-serving blue/green
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${PROJECT_DIR}/scripts/deploy-codedeploy-bluegreen.sh" \
+            "${ENVIRONMENT}" \
+            "ai-serving" \
+            "$(jq -r '."ai-serving"' '${{ steps.images.outputs.manifest_path }}')"
+
+      - name: Smoke test production
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.PROD_BASE_URL }}
+        run: "${PROJECT_DIR}/scripts/smoke-test.sh"

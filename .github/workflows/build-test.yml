@@ -1,0 +1,127 @@
+name: build-test
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  push:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_DIR: xbrain-learners/capstone/tf-4/cdo-07
+
+jobs:
+  build-test:
+    name: Build and test ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - ingest-service
+          - ingest-worker
+          - ai-serving
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect service source
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          service_dir="${PROJECT_DIR}/services/${{ matrix.service }}"
+          echo "service_dir=${service_dir}" >> "$GITHUB_OUTPUT"
+
+          if [[ -d "$service_dir" ]]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Service source missing::${service_dir} does not exist yet. This job is skipped until service code is added."
+          fi
+
+      - name: Set up Node.js
+        if: steps.detect.outputs.exists == 'true' && hashFiles(format('{0}/package.json', steps.detect.outputs.service_dir)) != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ${{ steps.detect.outputs.service_dir }}/package-lock.json
+
+      - name: Test Node.js service
+        if: steps.detect.outputs.exists == 'true' && hashFiles(format('{0}/package.json', steps.detect.outputs.service_dir)) != ''
+        working-directory: ${{ steps.detect.outputs.service_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            npm install
+          fi
+          npm test --if-present
+
+      - name: Set up Python
+        if: steps.detect.outputs.exists == 'true' && (hashFiles(format('{0}/requirements.txt', steps.detect.outputs.service_dir)) != '' || hashFiles(format('{0}/pyproject.toml', steps.detect.outputs.service_dir)) != '')
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test Python service
+        if: steps.detect.outputs.exists == 'true' && (hashFiles(format('{0}/requirements.txt', steps.detect.outputs.service_dir)) != '' || hashFiles(format('{0}/pyproject.toml', steps.detect.outputs.service_dir)) != '')
+        working-directory: ${{ steps.detect.outputs.service_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          fi
+          if [[ -f pyproject.toml ]]; then
+            pip install -e '.[test]' || pip install -e .
+          fi
+          if [[ -d tests ]]; then
+            python -m pytest -q
+          else
+            echo "::notice title=No Python tests::No tests directory found for ${{ matrix.service }}."
+          fi
+
+      - name: Set up Go
+        if: steps.detect.outputs.exists == 'true' && hashFiles(format('{0}/go.mod', steps.detect.outputs.service_dir)) != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: ${{ steps.detect.outputs.service_dir }}/go.sum
+
+      - name: Test Go service
+        if: steps.detect.outputs.exists == 'true' && hashFiles(format('{0}/go.mod', steps.detect.outputs.service_dir)) != ''
+        working-directory: ${{ steps.detect.outputs.service_dir }}
+        shell: bash
+        run: go test ./...
+
+      - name: Build Docker image
+        if: steps.detect.outputs.exists == 'true' && hashFiles(format('{0}/Dockerfile', steps.detect.outputs.service_dir)) != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --tag "tf4-cdo07-${{ matrix.service }}:${GITHUB_SHA}" \
+            "${{ steps.detect.outputs.service_dir }}"
+
+      - name: Summarize skipped service
+        if: steps.detect.outputs.exists != 'true'
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.service }}"
+            echo ""
+            echo "Skipped: service source directory is not present yet."
+          } >> "$GITHUB_STEP_SUMMARY"

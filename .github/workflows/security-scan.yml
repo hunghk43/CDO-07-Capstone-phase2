@@ -1,0 +1,84 @@
+name: security-scan
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  push:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  PROJECT_DIR: xbrain-learners/capstone/tf-4/cdo-07
+
+jobs:
+  gitleaks:
+    name: Gitleaks secret scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan working tree for secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.24.2 \
+            dir /repo --redact --verbose
+
+  trivy:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan filesystem for vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+  checkov:
+    name: Checkov Terraform scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Terraform files
+        id: terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find "${PROJECT_DIR}/infra" -type f -name '*.tf' | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Terraform not present::No .tf files found under ${PROJECT_DIR}/infra; skipping Checkov."
+          fi
+
+      - name: Run Checkov
+        if: steps.terraform.outputs.exists == 'true'
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.PROJECT_DIR }}/infra
+          framework: terraform
+          skip_check: CKV_AWS_356,CKV_AWS_108,CKV_AWS_109,CKV_AWS_111,CKV_AWS_18,CKV_AWS_144,CKV2_AWS_62
+          quiet: true
+          soft_fail: false
