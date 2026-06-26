@@ -1,200 +1,131 @@
-# Architecture Decision Records - CDO-07 · Task Force 4
+# Hồ sơ Quyết định Kiến trúc - CDO-07 · Task Force 4
 
-<!-- Doc owner: CDO-07
-     Status: Ongoing log W11-W12. Append-only - KHÔNG xóa ADR cũ.
-     Last updated: 2026-06-23
-     Word count target: 800-1500 từ (cả file) -->
+<!-- Chủ sở hữu tài liệu: CDO-07
+     Trạng thái: Đang ghi liên tục W11-W12. Chỉ thêm mới - KHÔNG xóa ADR cũ.
+     Cập nhật lần cuối: 2026-06-26 -->
 
-> **Append-only**: khi 1 ADR bị thay thế, đánh dấu `Status: Superseded by ADR-NNN`. KHÔNG xóa.
-> **Target**: ≥3 ADR hoàn chỉnh Pack #1 (W11 T6) · ≥5 ADR Pack #2 (W12 T4)
-
----
-
-## ADR-000 - Infra angle ban đầu: Serverless-first (Lambda + AMP)
-
-- **Status**: Superseded by ADR-001
-- **Date**: 2026-06-22
-- **Context**: Draft ban đầu CDO-07 chọn serverless-first (Lambda cho AI engine + Amazon
-  Managed Prometheus cho storage) vì ops overhead thấp và cost pay-per-invocation.
-- **Decision**: Lambda + AMP làm primary stack.
-- **Consequence**:
-  - Không cần manage server, cost thấp khi idle
-  - AMP là pull-based, không match push-ingest pattern từ microservice
-  - Lambda cold start ~500ms, Circuit Breaker cần stateful process → không phù hợp
-- **Alternatives considered**: N/A (draft ban đầu, chưa compare đủ)
-
-> **Superseded by ADR-001** (2026-06-23): sau khi review diagram và TF4 requirements
-> chi tiết, team đổi sang event-driven hybrid. Lý do cụ thể xem ADR-001.
+> **Quy tắc**: Khi 1 ADR bị thay thế, đánh dấu `Trạng thái: Thay thế bởi ADR-NNN`. KHÔNG xóa.
+> **Mục tiêu**: ≥3 ADR hoàn chỉnh Pack #1 (W11 T6) · ≥5 ADR Pack #2 (W12 T4)
 
 ---
 
-## ADR-001 - Infra angle: Event-driven hybrid (ECS Fargate + Kinesis + Timestream + Amazon Managed Grafana)
-- **Status**: Accepted
-- **Date**: 2026-06-23 (Updated 2026-06-25)
-- **Context**: TF4 yêu cầu ingest high-volume time-series từ 3 tier-1 service, AI engine
-  predict drift với lead time ≥15 phút, Grafana annotation overlay, budget $200/2 tuần.
-  Serverless-first (ADR-000) bị loại vì AMP pull-based không match push-ingest và Lambda
-  không giữ được Circuit Breaker state. CDO-07 cần angle khác biệt so với 2 CDO còn lại.
-- **Decision**: Chọn **event-driven** hybrid: k6 → ALB → mock services emit metric →
-  Kinesis Data Streams (3 shards) → Kinesis Firehose → Lambda Transformer (PII drop) →
-  Timestream. AI Serving trên ECS Fargate, EventBridge trigger mỗi 5 phút qua Lambda
-  Window Feeder (query 2h window, gọi /v1/predict, timeout 5.0s), có Fail-Open Fallback
-  (static thresholds) khi AI timeout, và SSM Param Store làm toggle inference_enabled
-  cho cost circuit breaker (Lambda CB, xem mục 7 + component table trong 02_infra_design.md).
-  Output qua Amazon Managed Grafana annotation + SNS → Slack. Audit log ghi S3 SSE-KMS.
-- **Consequence**:
-  - Kinesis Data Streams buffer + absorb traffic spike (sudden spike 3× scenario) mà
-  không drop metric, đồng thời partition theo service_id cho multi-tenant isolation
-  và có 24h replay capability cho testing (xem 02_infra_design.md mục 4.4)
-  - ECS Fargate giữ Circuit Breaker state liên tục, không cold start
-  - Amazon Managed Grafana: tích hợp trực tiếp Timestream plugin, không cần tự quản lý server/version/availability của Grafana — đổi lại tốn license $9/workspace/month so với self-host, nhưng giảm ops overhead phù hợp timeline 3 tuần
-  - Lambda Window Feeder + Fail-Open Fallback + SSM toggle thêm 1 lớp resilience: khi AI Engine timeout hoặc bị tắt qua cost circuit breaker, hệ thống fail-open sang static thresholds (CPU>85%, Mem>90%, Conn>450, Queue>10k) thay vì mất giám sát hoàn toàn
-  - Nhiều component hơn serverless-first: tăng surface area debug trong 6 ngày W12
-  - Timestream SQL syntax khác PromQL: cần sync với AI team trong Telemetry Contract
-- **Alternatives considered**:
-  - **Serverless-first (AMP + Lambda)**: rejected - AMP pull-based không match push pattern,
-    Lambda cold start conflict Circuit Breaker (xem ADR-000)
-  - **Lakehouse (S3 + Athena)**: rejected - Athena latency 2-10s → risk miss lead time ≥15 phút
-  - **Kinesis thay SQS**: rejected - shard management phức tạp hơn, capstone không cần replay
+## ADR-000 - Góc độ hạ tầng ban đầu: Kinesis + Timestream
+
+- **Trạng thái**: Thay thế bởi ADR-001
+- **Ngày**: 2026-06-22
+- **Bối cảnh**: Bản phác thảo ban đầu CDO-07 chọn TSDB-Centric Hybrid Streaming — mock services đẩy metric vào Kinesis Data Streams → Firehose → Lambda Transformer (lọc PII) → Amazon Timestream. AI Engine (ECS Fargate) truy vấn cửa sổ 2h từ Timestream, EventBridge kích hoạt mỗi 5 phút. Timestream được chọn vì hỗ trợ time-series query độ trễ thấp, Kinesis làm bộ đệm hấp thụ spike 3×.
+- **Quyết định**: Kinesis Data Streams (3 shard) + Firehose + Lambda Transformer + Amazon Timestream làm stack chính.
+- **Hệ quả**:
+  - Timestream bị **chặn do tài khoản** — dịch vụ không khả dụng trong tài khoản AWS capstone
+  - Chi phí ước tính $179.92/tháng, chỉ cách ngưỡng circuit breaker $180 đúng $0.08
+  - Kinesis Firehose + Lambda Transformer thêm độ phức tạp không cần thiết cho 6 ngày W12
+- **Phương án đã xem xét**: Không có — bị loại hoàn toàn do blocker khả dụng dịch vụ
+
+> **Thay thế bởi ADR-001** (2026-06-25): Timestream không khả dụng trong tài khoản capstone buộc team đánh giá lại toàn bộ stack. Chuyển sang ADOT + AMP — rẻ hơn 60%, quen thuộc hơn với team, zero-ops.
 
 ---
 
-## ADR-002 - Time-series storage: Amazon Timestream
+## ADR-001 - Góc độ hạ tầng chính: Event-Driven + ADOT/AMP
 
-- **Status**: Accepted
-- **Date**: 2026-06-23
-- **Context**: Telemetry Contract yêu cầu storage support time-series query hiệu quả, không
-  phải raw S3. AI engine query 2h window gần nhất để detect drift. Retention ≥90 ngày.
-  Volume capstone: 3 service × ~20 metrics, nhưng design phải scale tới 50k events/sec.
-- **Decision**: **Amazon Timestream** với 2-tier: memory store 2 ngày (fast query AI predict)
-  + magnetic store 90 ngày (cheap, đáp ứng retention). Ingest Worker BatchWrite 100 records/call.
-  AI engine query qua VPC Endpoint, không ra Internet.
-- **Consequence**:
-  - Managed service: AWS handle provisioning/scaling, CDO-07 không manage server
-  - 2-tier tự động: hot data memory store cho AI query, cold data magnetic store cho audit
-  - IAM auth + VPC Endpoint native, không cần custom auth layer
-  - Vendor lock-in: migrate sau capstone cần rewrite query layer trong AI engine
-  - Không support upsert: Ingest Worker retry cùng timestamp → duplicate, cần idempotency check
-- **Alternatives considered**:
-  - **AMP**: PromQL native, Grafana plug-and-play. Rejected - pull-based không match Ingest Worker
-    push pattern (đã loại ở ADR-001)
-  - **S3 + Athena**: cheapest $0.023/GB. Rejected - query latency 2-10s block AI predict call
-  - **InfluxDB self-hosted**: powerful TSDB. Rejected - ops overhead quản lý server không
-    phù hợp 6 ngày build W12.
+- **Trạng thái**: Đã chấp nhận
+- **Ngày**: 2026-06-25
+- **Bối cảnh**: ADR-000 bị chặn do Timestream không khả dụng. TF4 yêu cầu thu nạp time-series khối lượng lớn từ 3 mock service tier-1, AI Engine phát hiện drift với thời gian dự báo ≥15 phút, hiển thị annotation trên Grafana, ngân sách $200/tháng. Team cần góc độ khả thi trong 6 ngày W12 với zero-ops overhead.
+- **Quyết định**: Chọn **Event-Driven + ADOT/AMP**: k6 → ALB → mock services (ECS Fargate) → **ADOT Sidecar** thu thập metric → **Amazon Managed Prometheus (AMP)** làm TSDB → **Amazon Managed Grafana** hiển thị + annotation. AI Engine (ECS Fargate) truy vấn AMP qua PromQL (range query cửa sổ 2h), EventBridge kích hoạt mỗi 5 phút qua Lambda Window Feeder, Fail-Open Fallback (ngưỡng tĩnh) khi AI timeout, SSM Parameter Store làm công tắc `InferenceEnabled` cho cost circuit breaker.
+- **Hệ quả**:
+  - AMP hỗ trợ PromQL native — team quen thuộc, không cần học cú pháp SQL mới như Timestream
+  - ADOT Sidecar chuẩn OpenTelemetry, tích hợp thẳng vào ECS task definition — loại bỏ hoàn toàn pipeline Kinesis
+  - Chi phí giảm 60% so với ADR-000: $145.15/tháng (80.6% ngân sách), dư $54.85
+  - Amazon Managed Grafana có plugin AMP datasource tích hợp sẵn — không cần cấu hình thêm
+  - Toàn bộ traffic đi qua VPC Endpoints, không cần NAT Gateway
+  - ADOT Sidecar tiêu thụ thêm 0.25 vCPU / 0.5 GB mỗi ECS task (+$35.56/tháng cho 4 task)
+  - VPC Endpoints chiếm 20% tổng ngân sách ($28.80) — cần thiết nhưng tốn kém
+- **Phương án đã xem xét**:
+  - **Kinesis + Timestream (ADR-000)**: loại — Timestream bị chặn tài khoản, chi phí sát ngưỡng $180
+  - **Lakehouse (S3 + Athena)**: loại — độ trễ truy vấn Athena 2–10 giây, có nguy cơ vượt quá thời gian dự báo ≥15 phút; batch delay của Glue không phù hợp thu nạp thời gian thực
+  - **CloudWatch Custom Metrics**: loại — tự động nén dữ liệu sau 15 ngày, mất tín hiệu slow drift cho AI; chi phí bùng nổ với 600+ metric × $0.30/metric/tháng
 
 ---
 
-## ADR-003 - Compute cho AI Serving: ECS Fargate over Lambda / EKS
+## ADR-002 - Thu thập và lưu trữ metric: ADOT Sidecar + AMP
 
-- **Status**: Accepted
-- **Date**: 2026-06-23
-- **Context**: AI Serving expose `POST /v1/predict`, nhận traffic qua ALB path-based routing (`/v1/predict`), thực hiện drift detection + capacity recommendation, và phải maintain Circuit Breaker (3× fail → OPEN → static CloudWatch alarms → Fail-Open) liên tục giữa các request. AI Serving cũng được EventBridge trigger định kỳ mỗi 5 phút để chạy batch prediction, đồng thời cần giữ connection pooling ổn định tới Amazon Timestream (query 2h window) và Audit Table để ghi `output { drift_detected, confidence, recommendation, evidence_link }`. ADR-000 đã loại Lambda do cold start (~500ms) xung đột với yêu cầu giữ state Circuit Breaker; ADR-001 chốt hướng event-driven hybrid nhưng chưa quyết định cụ thể giữa các lựa chọn container compute.
-- **Decision**: Chọn **ECS Fargate** làm compute layer cho AI Serving (cùng pattern với Ingest Service, Ingest Worker). Container image build và push lên **Amazon ECR**, ECS task pull image, chạy trong Private Subnet App Tier, expose qua ALB target group ở path `/v1/predict`.
-- **Consequence**:
-  - Giữ được Circuit Breaker state liên tục trong vòng đời task — không bị reset mỗi lần invoke như Lambda
-  - Connection pooling tới Timestream + Audit Table ổn định, tránh overhead tạo lại connection mỗi request
-  - Không cold start: đáp ứng tốt yêu cầu lead time ≥15 phút cho drift prediction và nhịp trigger 5 phút từ EventBridge
-  - Phải tự quản lý task definition, service auto-scaling (CPU/queue depth), và ECR lifecycle — overhead vận hành cao hơn Lambda
-  - Cost cố định cao hơn Lambda khi traffic thấp do Fargate task chạy liên tục, không scale-to-zero
-- **Alternatives considered**:
-  - **Lambda**: rejected — cold start xung đột với yêu cầu giữ Circuit Breaker state liên tục (đã loại từ ADR-000); thêm vào đó EventBridge trigger 5 phút + connection pooling tới Timestream sẽ kém hiệu quả nếu mỗi invocation phải khởi tạo lại connection
-  - **EKS**: rejected — overhead vận hành K8s control plane (RBAC, networking, node group) không cần thiết ở scale capstone (3 service, 1 AZ); ECS Fargate đã đáp ứng đủ yêu cầu mà không cần quản lý control plane
-
----
-
-## ADR-004 - Ingestion pipeline: Kinesis Data Streams + Firehose giữa Mock Services và Timestream
-
-- **Status**: Accepted (Updated 2026-06-25 — xem ghi chú Update trong ADR-001)
-- **Date**: 2026-06-23
-- **Context**: 3 mock service (Payment GW, Ledger, Fraud detection) liên tục bắn metric ra ngoài.
-  Nếu cứ để chúng ghi thẳng vào Timestream, một traffic spike (test scenario yêu cầu chịu
-  được spike 3×) sẽ làm nghẽn hoặc rớt metric vì Timestream cần ghi theo batch mới tối
-  ưu, không hợp để ghi từng record lẻ tẻ ngay khi nó tới. Ngoài ra, theo mục 4.4 của
-  02_infra_design.md, mỗi service cần được cách ly throughput với nhau (multi-tenant), và
-  team cũng muốn có khả năng replay lại data trong 24h để debug khi cần, vì timeline W12
-  chỉ có 6 ngày để build nên không có nhiều cơ hội tái tạo lại sự cố thủ công.
-- **Decision**: Cho mock service bắn metric vào **Kinesis Data Streams** (3 shard, dùng
-  `service_id` làm partition key), từ đó chảy qua **Kinesis Firehose** (buffer 60 giây)
-  tới **Lambda Transformer**. Lambda này làm 2 việc trong 1 bước: định dạng lại data cho
-  đúng schema Timestream, và lọc field nhạy cảm (PII) trước khi ghi. Sau đó mới ghi vào
-  Timestream. Luồng này hoàn toàn tách biệt với luồng AI Serving (đọc baseline từ S3, query
-  Timestream cửa sổ 2h) — hai bên không đụng vào nhau.
-- **Consequence**: Kinesis đứng giữa làm bộ đệm nên spike 3× không làm mock service bị
-  nghẽn hay rớt request. Vì partition theo `service_id`, mỗi service tự động được route vào
-  shard riêng, throughput không lấn nhau (đúng yêu cầu chống noisy-neighbor ở mục 4.4) — và
-  còn có thêm 24h replay để debug, thứ mà SQS không có. Việc gộp transform + PII filter vào
-  cùng 1 Lambda cũng giúp đỡ một bước trung gian, không cần tách riêng component lọc PII.
-
-  Đổi lại, data sẽ không xuất hiện trong Timestream ngay tức thì — phải đi qua Kinesis rồi
-  buffer ở Firehose 60s rồi mới tới Lambda transform — nên cần để ý độ trễ này không ăn hết
-  ngân sách thời gian so với yêu cầu lead time ≥15 phút của AI Serving. Một rủi ro khác là
-  Timestream không hỗ trợ upsert, nên nếu Lambda Transformer phải retry (do lỗi tạm thời),
-  có thể ghi trùng cùng timestamp — đã ghi nhận ở ADR-002, cần có idempotency check để xử lý.
-  Kinesis On-Demand tự scale shard theo traffic nên không phải lo capacity planning thủ công,
-  nhưng vẫn có quota giới hạn của AWS cần theo dõi nếu traffic vượt xa mức thiết kế ban đầu
-  (xem thêm mục 3.3 weakness trong 02_infra_design.md).
-- **Alternatives considered**:
-  - **Ghi thẳng từ mock service vào Timestream, không qua queue/stream nào**: bị loại vì
-    không chịu được spike 3× — sẽ rớt metric hoặc làm response chậm lại
-  - **Amazon SQS**: bị loại vì SQS không hỗ trợ partition theo `service_id`, nên không cách
-    ly được throughput giữa các service, và cũng không có khả năng replay. Kinesis On-Demand
-    vận hành đơn giản tương đương SQS mà lại có thêm 2 cái này, nên chọn Kinesis hợp lý hơn
-  - **Apache Kafka trên MSK**: bị loại vì phải tự quản lý cluster, chi phí cao hơn mức ngân
-    sách $200/1 tháng cho phép, không hợp với timeline ngắn của dự án này
+- **Trạng thái**: Đã chấp nhận
+- **Ngày**: 2026-06-25
+- **Bối cảnh**: Sau khi chốt góc độ ADOT/AMP (ADR-001), cần quyết định cụ thể về (1) cơ chế đẩy metric từ mock services vào AMP và (2) cấu hình AMP làm TSDB chính. Phương án thay thế là giữ lại pipeline Kinesis nhưng thay đích đến từ Timestream sang AMP.
+- **Quyết định**: Chọn **ADOT Sidecar** chạy trong cùng ECS task definition với mỗi service. ADOT scrape Prometheus-format metrics theo chuẩn OpenTelemetry, đẩy vào **AMP workspace** qua remote_write (HTTPS, xác thực SigV4). AI Engine truy vấn AMP qua PromQL `query_range` với `start=now-2h`. Retention 150 ngày (vượt yêu cầu 90 ngày). Chi phí $0.93/tháng ở quy mô demo (10M samples).
+- **Hệ quả**:
+  - Loại bỏ Kinesis Data Streams + Firehose + Lambda Transformer: tiết kiệm ~$32.85/tháng và giảm đáng kể độ phức tạp
+  - ADOT là bản phân phối OpenTelemetry do AWS quản lý — chuẩn ngành, zero-ops sidecar, xác thực SigV4 tích hợp sẵn
+  - Multi-tenant qua label `service_id` — cô lập truy vấn bằng PromQL filter, không cần bảng riêng
+  - ADOT Sidecar lỗi sẽ ảnh hưởng toàn bộ việc thu thập metric của task đó — cần liveness probe riêng
+  - Không còn khả năng replay 24h như Kinesis Firehose — debug phải dùng Grafana historical query
+  - AMP không hỗ trợ SQL joins — AI Engine phải tự tương quan nhiều metric trong code
+- **Phương án đã xem xét**:
+  - **Kinesis Data Streams + Lambda Transformer**: loại — chi phí $32.85/tháng Kinesis Provisioned; pipeline phức tạp không cần thiết khi AMP chấp nhận remote_write trực tiếp
+  - **Đẩy metric trực tiếp từ code ứng dụng (SDK)**: loại — tăng coupling giữa business logic và observability; vi phạm tách biệt mối quan tâm (separation of concerns)
+  - **Prometheus tự quản trên EC2**: loại — overhead vận hành vi phạm yêu cầu zero-ops; ~$35/tháng + thời gian vá lỗi; không phù hợp 6 ngày W12
 
 ---
 
-## ADR-005 - Audit Log storage: Amazon S3 + Lifecycle Policy over DynamoDB
+## ADR-003 - Nền tảng tính toán cho AI Serving: ECS Fargate
 
-- **Status**: Accepted
-- **Date**: 2026-06-25
-- **Context**: Hệ thống cần lưu trữ Audit Log sinh ra từ mỗi lần AI Serving gọi ML Model,
-  phục vụ 4 mục đích: Audit (kiểm toán), Incident Investigation (điều tra sự cố),
-  Prediction Traceability (truy vết lịch sử dự đoán), và đáp ứng yêu cầu compliance lưu trữ dữ liệu.
+- **Trạng thái**: Đã chấp nhận
+- **Ngày**: 2026-06-23
+- **Bối cảnh**: AI Serving cần expose `POST /v1/predict`, duy trì trạng thái Circuit Breaker liên tục giữa các request (3 lần lỗi → OPEN → Fail-Open với ngưỡng tĩnh), duy trì connection pooling ổn định tới AMP (truy vấn cửa sổ 2h) và S3 (ghi audit log). EventBridge kích hoạt định kỳ mỗi 5 phút. Lambda cold start (~500ms+) xung đột với yêu cầu giữ trạng thái và p99 latency <500ms.
+- **Quyết định**: Chọn **ECS Fargate** làm nền tảng tính toán cho AI Serving. Container image lưu trên **Amazon ECR**, ECS task chạy trong Private Subnet App Tier, expose qua ALB target group tại path `/v1/predict`. Task definition cấu hình ADOT Sidecar để tự động phát metric AI (latency dự đoán, drift_detected rate, confidence score) vào AMP — nhất quán với mock services.
+- **Hệ quả**:
+  - Duy trì trạng thái Circuit Breaker liên tục trong vòng đời task — không bị đặt lại mỗi lần invoke như Lambda
+  - Connection pooling tới AMP ổn định, tránh overhead khởi tạo lại kết nối mỗi request
+  - Không cold start — đáp ứng thời gian dự báo ≥15 phút và chu kỳ kích hoạt 5 phút của EventBridge
+  - Chi phí cố định cao hơn Lambda khi lưu lượng thấp — Fargate task chạy liên tục, không scale-to-zero
+- **Phương án đã xem xét**:
+  - **Lambda**: loại — cold start xung đột với yêu cầu duy trì trạng thái Circuit Breaker; mỗi lần invoke phải khởi tạo lại kết nối AMP; timeout 15 phút có thể chặn cửa sổ test 2h+
+  - **EKS**: loại — overhead quản lý control plane K8s (RBAC, networking, node group) không cần thiết ở quy mô capstone 3 service; ECS Fargate đáp ứng đủ mà không cần quản lý control plane
 
-  Yêu cầu chính:
-  - Lưu trữ tối đa **1 năm**.
-  - Dữ liệu được truy cập thường xuyên chủ yếu trong **90 ngày đầu**; sau đó truy cập rất thấp.
-  - Tối ưu chi phí lưu trữ dài hạn khi khối lượng log tăng liên tục theo số lần prediction.
-  - Không yêu cầu truy xuất thời gian thực hay độ trễ mili giây — audit chỉ diễn ra theo lịch
-    hoặc khi có yêu cầu điều tra cụ thể.
-  - Cần khả năng mở rộng không giới hạn khi số lượng user, frequency gọi model, hoặc số
-    lượng ML model tăng trong tương lai.
+---
 
-  Hai phương án được đánh giá: **(1) Amazon S3** và **(2) Amazon DynamoDB**.
+## ADR-004 - Lưu trữ Audit Log: Amazon S3 + Lifecycle Policy
 
-- **Decision**: Chọn **Amazon S3** làm hệ thống lưu trữ chính cho Audit Log, quản lý dữ liệu
-  bằng **S3 Lifecycle Policy** tự động chuyển tier theo thời gian:
+- **Trạng thái**: Đã chấp nhận
+- **Ngày**: 2026-06-25
+- **Bối cảnh**: Hệ thống cần lưu Audit Log từ mỗi lần AI Serving gọi ML Model, phục vụ kiểm toán, điều tra sự cố, truy vết lịch sử dự đoán và compliance lưu trữ 1 năm. Dữ liệu được truy cập thường xuyên chủ yếu trong 90 ngày đầu, sau đó rất thấp. Không yêu cầu truy vấn thời gian thực.
+- **Quyết định**: Chọn **Amazon S3** với **S3 Lifecycle Policy** tự động chuyển tier:
 
-  | Giai đoạn       | Storage Class               |
-  |-----------------|-----------------------------|
-  | 0 – 90 ngày     | S3 Standard                 |
-  | 90 – 365 ngày   | S3 Glacier Deep Archive     |
-  | Sau 365 ngày    | Xóa tự động (Expiration rule) |
+  | Giai đoạn     | Storage Class           |
+  |---------------|-------------------------|
+  | 0 – 30 ngày   | S3 Standard             |
+  | 30 – 90 ngày  | S3 Infrequent Access    |
+  | 90 – 365 ngày | S3 Glacier Deep Archive |
+  | Sau 365 ngày  | Xóa tự động             |
 
-  AI Serving ghi Audit Log trực tiếp vào S3 (PutObject) sau mỗi lần predict. Dữ liệu được
-  mã hóa SSE-KMS (nhất quán với ADR-001). Khi có yêu cầu audit hoặc điều tra, dữ liệu trong
-  Glacier Deep Archive được khôi phục trước theo lịch với thời gian chờ chấp nhận được
-  (12–48h Standard Retrieval).
+  AI Serving ghi Audit Log trực tiếp vào S3 (PutObject, SSE-KMS) sau mỗi lần dự đoán. Khi cần audit: khôi phục từ Glacier (12–48h), sau đó truy vấn bằng Amazon Athena.
 
-- **Consequence**:
-  - **Ưu điểm**:
-    - Giảm chi phí lưu trữ dài hạn đáng kể: Glacier Deep Archive rẻ hơn S3 Standard ~95%
-      và rẻ hơn DynamoDB storage nhiều lần khi data volume tăng theo tháng/năm
-    - Lifecycle Policy tự động chuyển tier — không cần can thiệp thủ công, không cần
-      capacity planning phức tạp
-    - Scalability gần như không giới hạn: S3 không cần provision throughput hay shard như DynamoDB
-    - Tích hợp tự nhiên với Athena / Glue nếu cần phân tích log theo batch trong tương lai
-    - SSE-KMS native, nhất quán với cấu hình security toàn hệ thống (ADR-001)
-  - **Nhược điểm**:
-    - Dữ liệu trong Glacier Deep Archive cần 12–48h để khôi phục trước khi truy cập —
-      cần lên kế hoạch trước các đợt audit với dữ liệu > 90 ngày
-    - Không hỗ trợ truy vấn trực tiếp trên object (cần Athena hoặc tải xuống để query)
-    - Không phù hợp cho bất kỳ use case nào cần đọc Audit Log theo thời gian thực
+- **Hệ quả**:
+  - Glacier Deep Archive rẻ hơn S3 Standard ~95% — tối ưu chi phí dài hạn khi log tích lũy theo năm
+  - Lifecycle Policy tự động chuyển tier, không cần can thiệp thủ công
+  - Khả năng mở rộng gần như không giới hạn — không cần provision throughput như DynamoDB
+  - SSE-KMS nhất quán với baseline bảo mật toàn hệ thống
+  - Dữ liệu trong Glacier cần 12–48h để khôi phục — không truy xuất tức thì khi audit khẩn cấp với data >90 ngày
+- **Phương án đã xem xét**:
+  - **Amazon DynamoDB**: loại — chi phí lưu trữ dài hạn cao hơn S3 khi data tích lũy; millisecond latency của DynamoDB không mang lại giá trị cho use case Ghi Một Lần, Đọc Hiếm Khi (WORR); không có lifecycle policy tự động giảm tier cost tương đương Glacier
 
-- **Alternatives considered**:
-  - **Amazon DynamoDB**: rejected — chi phí lưu trữ dài hạn cao hơn S3 khi data tích lũy
-    theo năm; tối ưu cho OLTP workload với truy vấn độ trễ thấp, nhưng Audit Log không có
-    yêu cầu đó; không có cơ chế lifecycle policy tự động giảm tier cost tương đương Glacier;
-    lợi thế millisecond latency của DynamoDB không mang lại giá trị tương xứng cho use case
-    Write Once, Read Rarely (WORR) của Audit Log
+---
+
+## ADR-005 - Hiển thị quan sát: Amazon Managed Grafana
+
+- **Trạng thái**: Đã chấp nhận
+- **Ngày**: 2026-06-25
+- **Bối cảnh**: Hệ thống cần dashboard hiển thị metric từ AMP và overlay annotation kết quả drift detection từ AI Engine. Yêu cầu: tích hợp native với AMP datasource, không quản lý server/phiên bản, phù hợp timeline 6 ngày W12.
+- **Quyết định**: Chọn **Amazon Managed Grafana** (1 workspace, 1 active editor/admin user, $9.00/tháng). AMP datasource plugin tích hợp sẵn — không cần cấu hình thủ công. AI Engine POST annotation qua Grafana HTTP API sau mỗi sự kiện phát hiện drift, hiển thị overlay trực tiếp trên biểu đồ time-series.
+- **Hệ quả**:
+  - AWS quản lý provisioning, vá lỗi, tính sẵn sàng cao — zero-ops cho máy chủ Grafana
+  - Plugin AMP datasource tích hợp sẵn với xác thực SigV4 — không cần cài đặt hay cấu hình thêm
+  - Tích hợp AWS SSO/IAM native — không cần quản lý user/password Grafana riêng
+  - License $9.00/workspace/tháng — chi phí cố định thêm so với self-hosted (miễn phí)
+  - Tùy chỉnh bị giới hạn — không thể cài plugin tùy ý như self-hosted
+- **Phương án đã xem xét**:
+  - **Grafana tự lưu trú trên ECS Fargate**: loại — cần quản lý image, task definition, nâng cấp phiên bản, backup; overhead vận hành không phù hợp timeline 6 ngày; phải cấu hình thủ công AMP datasource + xác thực SigV4
+  - **CloudWatch native dashboards**: loại — không hỗ trợ PromQL/AMP datasource; overlay annotation kém linh hoạt hơn Grafana; không phù hợp góc độ khác biệt ADOT/AMP
+
+---
+
+<!-- Chỉ thêm ADR mới ở dưới. Khi 1 ADR bị thay thế, đánh dấu Trạng thái + link chuyển tiếp. -->
